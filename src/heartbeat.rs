@@ -29,6 +29,18 @@ pub fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
     Some((total.saturating_sub(available) / 1024, total / 1024))
 }
 
+/// `path`, or its nearest ancestor that exists: the disk it will be on.
+fn existing(path: &Path) -> &Path {
+    let mut p = path;
+    while !p.exists() {
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => break,
+        }
+    }
+    p
+}
+
 /// How the machine is now; what cannot be read here is 0.
 pub fn metrics(work_dir: &Path) -> Metrics {
     // Without /proc (macOS), its total is still known, if not what is in use.
@@ -41,7 +53,7 @@ pub fn metrics(work_dir: &Path) -> Metrics {
         cpu_load: crate::sys::load_average().unwrap_or(0.0),
         memory_used,
         memory_total,
-        disk_free: crate::sys::disk_free(work_dir).unwrap_or(0),
+        disk_free: crate::sys::disk_free(existing(work_dir)).unwrap_or(0),
         cpus: std::thread::available_parallelism().map_or(0, |n| n.get() as u64),
     }
 }
@@ -81,6 +93,16 @@ mod tests {
             assert!(m.disk_free > 0);
         }
         assert!(m.cpus >= 1);
+    }
+
+    #[test]
+    fn disk_free_is_read_before_the_work_dir_exists() {
+        let missing = std::env::temp_dir().join("jobber-host-no-such-dir/not/yet");
+        assert!(!missing.exists());
+        assert_eq!(existing(&missing), std::env::temp_dir().as_path());
+        if cfg!(target_os = "linux") {
+            assert!(metrics(&missing).disk_free > 0);
+        }
     }
 
     fn wait_for(what: &str, f: impl Fn() -> bool) {
