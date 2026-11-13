@@ -147,6 +147,12 @@ fn main() -> ExitCode {
         config.labels,
         config.cgroup_parent.as_deref().unwrap_or("podman's default cgroup")
     );
+    // Runs are checked out under it, and its free disk is offered: made now,
+    // so a fresh host does not offer 0 MiB of disk and is never given a run.
+    if let Err(e) = std::fs::create_dir_all(&config.work_dir) {
+        log!("cannot make work_dir {}: {e}", config.work_dir.display());
+        return ExitCode::FAILURE;
+    }
     executor::sweep(&config.work_dir);
     let Some(identity) = identity(&config, offered) else {
         log!("stopped before registering");
