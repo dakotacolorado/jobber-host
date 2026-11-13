@@ -18,24 +18,22 @@ podman image, streams its log back and reports how it ended.
 
 ## Install
 
-Each change approval-service merges is released as the next tag,
-`v<version>-<n>` (`scripts/release`, its routine's last step); a computer runs
-the release it was installed from until it is installed again. On a Linux
+Releases are tags, `v<version>-<n>`; a computer runs the release it was
+installed from until it is installed again. On a Linux
 computer with rootless podman and cargo, or a mac with a podman machine, from a
 checkout of the latest release tag:
 
 ```sh
 git clone https://github.com/dakotacolorado/jobber-host && cd jobber-host
 git checkout "$(git tag -l 'v*-*' --sort=-v:refname | head -n 1)"
-scripts/install.sh --service https://<jobber>:8445 --registration-token-file <file holding jobber's RUNNER_TOKEN>
+scripts/install.sh --service https://<your-jobber> --registration-token-file <file holding jobber's RUNNER_TOKEN>
 ```
 
 On Linux that installs `~/.local/bin/jobber-host`, writes
 `~/.config/jobber-host/config.toml`, and runs it as the systemd user service
 `jobber-host.service`, its containers in `jobber.slice`, with lingering so it
 runs without a login. On macOS it is the LaunchAgent
-`com.github.dakotacolorado.jobber-host`. A job-runner on the same computer is
-left as it is. Run `scripts/install.sh` again from a newer tag to upgrade
+`com.github.dakotacolorado.jobber-host`. Run `scripts/install.sh` again from a newer tag to upgrade
 (it keeps the host's identity); `--uninstall` removes it, and `--purge` its
 config and identity too. [docs/add-a-host.md](docs/add-a-host.md) has the
 rest.
@@ -67,7 +65,7 @@ else the file `--config PATH` or `JOBBER_HOST_CONFIG` names. Every setting is
 in it:
 
 ```toml
-service = "https://jobber.example:8445"       # jobber's address
+service = "https://jobber.example"            # jobber's address
 registration_token_file = "/home/me/.config/jobber-host/registration-token"  # jobber's RUNNER_TOKEN
 name = "laptop"                                # default: the hostname; keeps the host's id
 labels = { arch = "x86_64" }

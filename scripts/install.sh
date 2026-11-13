@@ -10,8 +10,7 @@
 # Run from a checkout of jobber-host at a release (a v<version>-<n> tag). Builds with
 # cargo, installs ~/.local/bin/jobber-host, writes ~/.config/jobber-host/config.toml
 # if there is none, then jobber.slice and jobber-host.service (Linux), or the
-# LaunchAgent (macOS). A job-runner on the same computer, its jobs.slice and its
-# unit or agent, is left as it is. Says each thing it does.
+# LaunchAgent (macOS). Says each thing it does.
 set -eu
 
 name=jobber-host
@@ -83,7 +82,7 @@ elif ! command -v podman >/dev/null; then
 fi
 command -v cargo >/dev/null || { say "cargo is missing: install Rust (rustup) to build $name" >&2; exit 1; }
 
-# A release is a v<version>-<n> tag (scripts/release); any other checkout is
+# A release is a v<version>-<n> tag; any other checkout is
 # built too, named by its commit, for trying a change on this computer.
 if release=$(git describe --tags --exact-match --match 'v*-*' HEAD 2>/dev/null); then
   say "building $name $release"
