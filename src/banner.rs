@@ -12,21 +12,21 @@ const LETTERS: [&str; 6] = [
 ];
 
 /// jobber's mark (`MARK_PIXELS` in jobber's `src/banner.ts`), on its 18 by 12
-/// grid: a filled square, the job, sends three lines out to three open boxes,
-/// the computers that run it. The last row is blank so a terminal, drawing two
-/// rows a character, gives it as many rows as the letters.
+/// grid: three shipping containers, ribbed, one stacked on two, the runs each
+/// going out in its own image. The first and last rows are blank so a
+/// terminal, drawing two rows a character, gives it as many rows as the letters.
 const MARK_PIXELS: [&str; 12] = [
-    "..............####",
-    "............###..#",
-    "..........##..####",
-    "#####...##........",
-    "#####.##......####",
-    "###############..#",
-    "#####.##......####",
-    "#####...##........",
-    "..........##..####",
-    "............###..#",
-    "..............####",
+    "..................",
+    "....##########....",
+    "....#.#.##.#.#....",
+    "....#.#.##.#.#....",
+    "....##########....",
+    "..................",
+    "########..########",
+    "#.#..#.#..#.#..#.#",
+    "#.#..#.#..#.#..#.#",
+    "#.#..#.#..#.#..#.#",
+    "########..########",
     "..................",
 ];
 
@@ -143,12 +143,12 @@ mod tests {
         assert_eq!(
             mark(),
             [
-                "            ▄▄█▀▀█",
-                "▄▄▄▄▄   ▄▄▀▀  ▀▀▀▀",
-                "█████▄██▄▄▄▄▄▄█▀▀█",
-                "█████ ▀▀▄▄    ▀▀▀▀",
-                "          ▀▀▄▄█▀▀█",
-                "              ▀▀▀▀",
+                "    ▄▄▄▄▄▄▄▄▄▄",
+                "    █ █ ██ █ █",
+                "    ▀▀▀▀▀▀▀▀▀▀",
+                "█▀█▀▀█▀█  █▀█▀▀█▀█",
+                "█ █  █ █  █ █  █ █",
+                "▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀",
             ]
             .map(String::from)
         );
