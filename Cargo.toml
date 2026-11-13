@@ -1,0 +1,22 @@
+[package]
+name = "jobber-host"
+version = "0.1.0"
+edition = "2021"
+description = "Runs jobber's runs on a computer, each in its repo's rootless podman image."
+license = "MIT"
+repository = "https://github.com/dakotacolorado/jobber-host"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+# rustls rather than native-tls, so nothing on the machine has to provide openssl.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# For image tags: already in the build through rustls.
+ring = "0.17"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
