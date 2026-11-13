@@ -1,6 +1,6 @@
 ---
 name: test
-description: How to run jobber-host's checks and its podman tests. Use before submitting a change to jobber-host, and when reviewing one.
+description: How to run jobber-host's checks, its podman tests, and how a release reaches a computer. Use before submitting a change to jobber-host, and when reviewing one.
 ---
 
 # Testing jobber-host
@@ -24,10 +24,13 @@ env -u DS_URL -u DS_TOKEN -u WT_URL -u WT_TOKEN -u WS_URL -u WS_TOKEN -u AS_URL 
 env -u DS_URL -u DS_TOKEN -u WT_URL -u WT_TOKEN -u WS_URL -u WS_TOKEN -u AS_URL -u AS_TOKEN -u JS_URL -u JS_TOKEN -u AG_URL -u AG_TOKEN cargo test --locked
 env -u DS_URL -u DS_TOKEN -u WT_URL -u WT_TOKEN -u WS_URL -u WS_TOKEN -u AS_URL -u AS_TOKEN -u JS_URL -u JS_TOKEN -u AG_URL -u AG_TOKEN cargo clippy --locked --all-targets -- -D warnings
 env -u DS_URL -u DS_TOKEN -u WT_URL -u WT_TOKEN -u WS_URL -u WS_TOKEN -u AS_URL -u AS_TOKEN -u JS_URL -u JS_TOKEN -u AG_URL -u AG_TOKEN cargo fmt --check
+sh -n scripts/install.sh
+sh -n scripts/release
 ```
 
 `cargo test` needs no network: jobber is faked in-process, over HTTP and its
-WebSocket.
+WebSocket. Where `shellcheck` is installed, `shellcheck scripts/install.sh
+scripts/release` passes too.
 
 ## The podman tests (by hand)
 
@@ -67,3 +70,15 @@ and wait for its banner. Write a scratch config whose `service` is it,
 slice you made. Run `cargo run -- --config <it>` in the foreground, submit runs
 to jobber (`POST /runs` with the `AUTH_TOKEN`), and stop it with Ctrl+C,
 which stops and reports what it runs.
+
+## The release
+
+`scripts/release` tags the commit it runs at as the next
+`v<Cargo.toml version>-<n>` on GitHub and prints `deployed: <full commit>`; a
+commit already tagged `v<version>-*` is not tagged again. `scripts/release
+--dry-run` says which tag it would push and pushes nothing; an author may run
+it. Pushing a tag is the release's, never an author's.
+
+A computer takes a release by checking out its tag and running
+`scripts/install.sh` (README), which is its owner's step. `--version` then
+says the tag; a checkout at no tag builds too, named by its commit.
