@@ -18,8 +18,11 @@ podman image, streams its log back and reports how it ended.
 
 ## Install
 
-On a Linux computer with rootless podman and cargo, or a mac with a podman
-machine, from a checkout of the latest release tag:
+Each change approval-service merges is released as the next tag,
+`v<version>-<n>` (`scripts/release`, its routine's last step); a computer runs
+the release it was installed from until it is installed again. On a Linux
+computer with rootless podman and cargo, or a mac with a podman machine, from a
+checkout of the latest release tag:
 
 ```sh
 git clone https://github.com/dakotacolorado/jobber-host && cd jobber-host
