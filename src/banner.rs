@@ -31,7 +31,7 @@ const MARK_PIXELS: [&str; 12] = [
 ];
 
 /// jobber's line, verbatim.
-pub const TAGLINE: &str = "Submit code to run on whatever computers you have available.";
+pub const TAGLINE: &str = "Submit code to run on whatever computers you have.";
 
 /// What jobber-host is, in one line.
 pub const SUMMARY: &str =
