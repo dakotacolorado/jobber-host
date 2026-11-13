@@ -16,6 +16,27 @@ a computer. It measures the machine, registers with jobber what it offers,
 holds one connection jobber pushes runs over, runs each in its repo's rootless
 podman image, streams its log back and reports how it ended.
 
+## Install
+
+On a Linux computer with rootless podman and cargo, or a mac with a podman
+machine, from a checkout of the latest release tag:
+
+```sh
+git clone https://github.com/dakotacolorado/jobber-host && cd jobber-host
+git checkout "$(git tag -l 'v*-*' --sort=-v:refname | head -n 1)"
+scripts/install.sh --service https://<jobber>:8445 --registration-token-file <file holding jobber's RUNNER_TOKEN>
+```
+
+On Linux that installs `~/.local/bin/jobber-host`, writes
+`~/.config/jobber-host/config.toml`, and runs it as the systemd user service
+`jobber-host.service`, its containers in `jobber.slice`, with lingering so it
+runs without a login. On macOS it is the LaunchAgent
+`com.github.dakotacolorado.jobber-host`. A job-runner on the same computer is
+left as it is. Run `scripts/install.sh` again from a newer tag to upgrade
+(it keeps the host's identity); `--uninstall` removes it, and `--purge` its
+config and identity too. [docs/add-a-host.md](docs/add-a-host.md) has the
+rest.
+
 ## How a run runs
 
 A run names a repo, a commit and a job. jobber-host clones the repo at that
