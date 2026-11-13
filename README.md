@@ -9,7 +9,7 @@
  ╚════╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝      ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝     ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀
 ```
 
-**Submit code to run on whatever computers you have available.**
+**Submit code to run on whatever computers you have.**
 
 jobber-host runs [jobber](https://github.com/dakotacolorado/jobber)'s runs on
 a computer. It measures the machine, registers with jobber what it offers,
