@@ -7,9 +7,7 @@ login (lingering). On macOS it is a LaunchAgent,
 `com.github.dakotacolorado.jobber-host`, its containers in the podman
 machine.
 
-It sits beside a job-runner on the same computer and touches nothing of it:
-job-runner's binary, config, state, `job-runner.service` (or its agent) and
-`jobs.slice` are its own, and jobber-host's are `~/.local/bin/jobber-host`,
+Everything it installs is its own: `~/.local/bin/jobber-host`,
 `~/.config/jobber-host/`, `~/.local/state/jobber-host/`,
 `~/.local/share/jobber-host/`, `jobber-host.service` and `jobber.slice`.
 
@@ -27,10 +25,10 @@ job-runner's binary, config, state, `job-runner.service` (or its agent) and
   script then sets `git_credential_helper = "!gh auth git-credential"`), or
   a helper of your own in the config.
 - **jobber's registration token**, its `RUNNER_TOKEN`, in a file only you can
-  read, e.g. on the computer jobber runs on:
+  read, e.g.:
 
   ```sh
-  (umask 077; sed -n 's/^RUNNER_TOKEN=//p' ~/.config/jobber/env > /tmp/runner-token)
+  (umask 077; printf '%s\n' "$RUNNER_TOKEN" > /tmp/runner-token)
   ```
 
 ## Install
@@ -40,7 +38,7 @@ From a checkout of jobber-host's latest release tag
 `git checkout` the first):
 
 ```sh
-scripts/install.sh --service https://<jobber's host>:8445 --registration-token-file /tmp/runner-token
+scripts/install.sh --service https://<your-jobber> --registration-token-file /tmp/runner-token
 rm /tmp/runner-token
 ```
 
