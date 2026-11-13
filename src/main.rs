@@ -1,3 +1,4 @@
+mod banner;
 mod budget;
 mod capacity;
 mod config;
@@ -28,12 +29,7 @@ const VERSION: &str = match option_env!("JOBBER_HOST_RELEASE") {
     _ => env!("CARGO_PKG_VERSION"),
 };
 
-const TAGLINE: &str = "Submit code to run on whatever computers you have available.";
-
-const USAGE: &str =
-    "jobber-host runs jobber's runs on this computer, each in its repo's podman image.
-
-usage: jobber-host [--config PATH] [--slice-unit]
+const USAGE: &str = "usage: jobber-host [--config PATH] [--slice-unit]
 
   --config PATH   config file (default $XDG_CONFIG_HOME/jobber-host/config.toml,
                   or ~/.config/jobber-host/config.toml); JOBBER_HOST_CONFIG also names it
@@ -69,8 +65,13 @@ fn parse(mut args: impl Iterator<Item = String>, config: Option<PathBuf>) -> Res
     Ok(Asked::Run { config, slice_unit })
 }
 
-fn help() -> String {
-    format!("{TAGLINE}\n\n{USAGE}")
+/// The banner, then the options: `--help`.
+fn help(paint: &banner::Palette) -> String {
+    format!(
+        "{}\n{}\n\n{USAGE}",
+        banner::banner(paint),
+        paint.dim(&format!("jobber-host {VERSION}"))
+    )
 }
 
 fn main() -> ExitCode {
@@ -81,10 +82,13 @@ fn main() -> ExitCode {
     let (path, slice_unit) = match asked {
         Ok(Asked::Run { config, slice_unit }) => (config, slice_unit),
         Ok(Asked::Help) => {
-            println!("{}", help());
+            println!("{}", help(&banner::Palette::for_stdout()));
             return ExitCode::SUCCESS;
         }
         Ok(Asked::Version) => {
+            // The banner, ending in the version's line, which the install script reads.
+            let paint = banner::Palette::for_stdout();
+            println!("{}", banner::banner(&paint));
             println!("jobber-host {VERSION}");
             return ExitCode::SUCCESS;
         }
@@ -274,9 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn help_opens_with_jobbers_tagline_and_gives_the_options() {
-        let help = help();
-        assert!(help.starts_with(TAGLINE), "{help}");
+    fn help_opens_with_the_banner_and_tagline_and_gives_the_options() {
+        let help = help(&banner::Palette::new(false, false));
+        assert!(
+            help.starts_with(&format!("\n{}", banner::wordmark())),
+            "{help}"
+        );
+        assert!(help.contains(banner::TAGLINE), "{help}");
+        assert!(!help.contains('\x1b'), "{help}");
         for option in [
             "--config PATH",
             "--slice-unit",
