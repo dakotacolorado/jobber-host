@@ -33,7 +33,7 @@ passes too.
 
 ## The podman tests (by hand)
 
-Ten more, ignored by `cargo test`, need rootless podman, the network
+Eleven more, ignored by `cargo test`, need rootless podman, the network
 (busybox from docker.io) and a systemd user session: an image that will not
 build fails its run with the build's output in the log, a run writes in its
 workspace and it is deleted after, a run is sent only the credentials given
@@ -44,7 +44,8 @@ whose container monitor (conmon) is killed, as the OOM killer may do in its
 place, is failed with exit 137 at once, a run past its slice's memory is
 killed (exit 137) and failed, inside that slice, and a run canceled in a
 heartbeat's answer is stopped and completed canceled, and one its answer says
-has ended is stopped and not completed. The slice test runs in a throwaway
+has ended is stopped and not completed. A run given a GPU sees it, with `JOBBER_HOST_TEST_GPU` set to a CDI device
+podman can give (e.g. `nvidia.com/gpu=0`); without it that test passes at once. The slice test runs in a throwaway
 slice capped at 300M; make it first, and remove it after:
 
 ```sh
@@ -54,7 +55,7 @@ JOBBER_HOST_TEST_SLICE=jobbertest.slice env -u DS_URL -u DS_TOKEN -u WT_URL -u W
 rm ~/.config/systemd/user/jobbertest.slice && systemctl --user daemon-reload
 ```
 
-A pass: `10 passed`, exit 0. On a Mac, podman runs every container in its
+A pass: `11 passed`, exit 0. On a Mac, podman runs every container in its
 podman machine, so make and remove the slice there
 (`podman machine ssh "..."` around the same two lines) and run the tests from
 the Mac.

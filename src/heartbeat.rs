@@ -140,6 +140,7 @@ mod tests {
                     crate::budget::Resources {
                         cpu: crate::budget::Cpu::of(1.0),
                         memory: 1024,
+                        gpu: 0,
                     },
                     512,
                 )

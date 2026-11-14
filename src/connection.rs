@@ -55,6 +55,9 @@ enum Incoming {
         #[serde(default = "default_cpu")]
         cpu: f64,
         memory: u64,
+        /// Absent from a jobber before GPUs, which sends no run that needs one.
+        #[serde(default)]
+        gpu: u32,
         lease: u64,
     },
     Start {
@@ -398,11 +401,13 @@ impl<E: Executor> Host<E> {
                 attempt,
                 cpu,
                 memory,
+                gpu,
                 lease,
             } => {
                 let admitted = Resources {
                     cpu: Cpu::of(cpu),
                     memory,
+                    gpu,
                 };
                 Some(self.assign(run, attempt, admitted, lease, state, stop))
             }
@@ -493,14 +498,19 @@ impl<E: Executor> Host<E> {
         match self.budget.reserve_job(admitted) {
             Ok(reservation) => {
                 log!(
-                    "run {id}: attempt {attempt} assigned and accepted: {} {} at {}, {} CPU of {} free and {} MiB of {} MiB free",
+                    "run {id}: attempt {attempt} assigned and accepted: {} {} at {}, {} CPU of {} free and {} MiB of {} MiB free{}",
                     run.repo,
                     run.job,
                     run.commit,
                     admitted.cpu,
                     free.cpu,
                     admitted.memory,
-                    free.memory
+                    free.memory,
+                    if reservation.gpus.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", GPUs {}", reservation.gpus.join(" "))
+                    }
                 );
                 state.accepted.insert(
                     (id.clone(), attempt),
@@ -531,6 +541,7 @@ impl<E: Executor> Host<E> {
             run,
             cpu: admitted.cpu,
             memory: admitted.memory,
+            gpus: reservation.gpus.clone(),
             lease: lease.unwrap_or(assigned),
             secrets,
         };
@@ -842,6 +853,7 @@ mod tests {
         Resources {
             cpu: Cpu::of(cpus as f64),
             memory,
+            gpu: 0,
         }
     }
 
@@ -899,7 +911,7 @@ mod tests {
             first["type"], "heartbeat",
             "a heartbeat as soon as it connects"
         );
-        assert_eq!(first["free"], json!({"cpu": 2.0, "memory": 2048}));
+        assert_eq!(first["free"], json!({"cpu": 2.0, "memory": 2048, "gpu": 0}));
         assert_eq!(first["running"], json!([]));
         for key in ["cpuLoad", "memoryUsed", "memoryTotal", "diskFree", "cpus"] {
             assert!(first["metrics"][key].is_number(), "{key}: {first}");
@@ -1082,7 +1094,7 @@ mod tests {
             json!(["r1"]),
             "ids, as SendHeartbeat takes them"
         );
-        assert_eq!(beat["free"], json!({"cpu": 1.0, "memory": 1536}));
+        assert_eq!(beat["free"], json!({"cpu": 1.0, "memory": 1536, "gpu": 0}));
 
         fake.refuse.store(false, Ordering::SeqCst);
         let mut peer = fake.peer();

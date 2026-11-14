@@ -1,6 +1,8 @@
 //! Admission, as Kubernetes admits pods to a node's allocatable: a job is
-//! taken only while its CPU and memory requests fit what running jobs and
-//! image builds have not reserved. There is no count of jobs.
+//! taken only while its CPU, memory and GPU requests fit what running jobs
+//! and image builds have not reserved. There is no count of jobs. GPUs are
+//! devices, not amounts: a job is given its own, by name, and no other job
+//! has them while it holds them.
 
 use serde::{Serialize, Serializer};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -43,11 +45,12 @@ impl Serialize for Cpu {
     }
 }
 
-/// CPUs and MiB: what a host offers, what it has free, or what a job requests.
+/// CPUs, MiB and GPUs: what a host offers, what it has free, or what a job requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Resources {
     pub cpu: Cpu,
     pub memory: u64,
+    pub gpu: u32,
 }
 
 /// The pure arithmetic: no locks, no clock, every rule tested.
@@ -67,6 +70,8 @@ pub struct Budget {
     /// so the memory it waits for is freed by jobs ending rather than taken
     /// by new ones.
     waiting: u32,
+    /// The GPUs it offers, as podman's CDI device names, each with whether a job holds it.
+    gpus: Vec<(String, bool)>,
 }
 
 impl Budget {
@@ -78,11 +83,24 @@ impl Budget {
             cpu: Cpu::default(),
             reserved: 0,
             waiting: 0,
+            gpus: Vec::new(),
         }
     }
 
     pub fn with_overhead(self, overhead: u64) -> Budget {
         Budget { overhead, ..self }
+    }
+
+    /// Offers `devices`, podman CDI device names such as `nvidia.com/gpu=0`, one GPU each.
+    pub fn with_gpus(self, devices: &[String]) -> Budget {
+        Budget {
+            capacity: Resources {
+                gpu: devices.len() as u32,
+                ..self.capacity
+            },
+            gpus: devices.iter().map(|d| (d.clone(), false)).collect(),
+            ..self
+        }
     }
 
     /// Unreserved CPU, and unreserved memory less one job's overhead, so a
@@ -95,11 +113,13 @@ impl Budget {
                 .memory
                 .saturating_sub(self.reserved)
                 .saturating_sub(self.overhead),
+            gpu: self.gpus.iter().filter(|(_, held)| !held).count() as u32,
         }
     }
 
-    /// Takes what `request` asks for, or refuses and changes nothing.
-    pub fn reserve_job(&mut self, request: Resources) -> Result<(), String> {
+    /// Takes what `request` asks for, answering the GPUs it is given, or
+    /// refuses and changes nothing.
+    pub fn reserve_job(&mut self, request: Resources) -> Result<Vec<String>, String> {
         if self.waiting > 0 {
             return Err(
                 "an image build is waiting for memory: nothing more is taken until it has it"
@@ -125,14 +145,35 @@ impl Budget {
                 request.memory, free.memory
             ));
         }
+        if request.gpu > free.gpu {
+            return Err(format!(
+                "{} GPU does not fit the {} GPU free of {}",
+                request.gpu, free.gpu, self.capacity.gpu
+            ));
+        }
         self.cpu = Cpu(self.cpu.0 + request.cpu.0);
         self.reserved += request.memory + self.overhead;
-        Ok(())
+        let given: Vec<String> = self
+            .gpus
+            .iter_mut()
+            .filter(|(_, held)| !held)
+            .take(request.gpu as usize)
+            .map(|(name, held)| {
+                *held = true;
+                name.clone()
+            })
+            .collect();
+        Ok(given)
     }
 
-    pub fn release_job(&mut self, request: Resources) {
+    pub fn release_job(&mut self, request: Resources, gpus: &[String]) {
         self.cpu = self.cpu.saturating_sub(request.cpu);
         self.reserved = self.reserved.saturating_sub(request.memory + self.overhead);
+        for (name, held) in &mut self.gpus {
+            if gpus.contains(name) {
+                *held = false;
+            }
+        }
     }
 
     /// MiB a build for a job holding `job_memory` reserves beyond it. The job
@@ -184,11 +225,12 @@ impl Shared {
     }
 
     pub fn reserve_job(&self, request: Resources) -> Result<JobReservation, String> {
-        self.lock().reserve_job(request)?;
+        let gpus = self.lock().reserve_job(request)?;
         Ok(JobReservation {
             budget: self.clone(),
             memory: request.memory,
             cpu: request.cpu,
+            gpus,
         })
     }
 
@@ -229,14 +271,20 @@ pub struct JobReservation {
     budget: Shared,
     pub memory: u64,
     pub cpu: Cpu,
+    /// The GPUs it holds, as CDI device names, for its container alone.
+    pub gpus: Vec<String>,
 }
 
 impl Drop for JobReservation {
     fn drop(&mut self) {
-        self.budget.lock().release_job(Resources {
-            cpu: self.cpu,
-            memory: self.memory,
-        });
+        self.budget.lock().release_job(
+            Resources {
+                cpu: self.cpu,
+                memory: self.memory,
+                gpu: self.gpus.len() as u32,
+            },
+            &self.gpus,
+        );
         self.budget.0 .1.notify_all();
     }
 }
@@ -261,7 +309,62 @@ mod tests {
         Resources {
             cpu: Cpu::of(cpu),
             memory,
+            gpu: 0,
         }
+    }
+
+    fn gpus(cpu: f64, memory: u64, gpu: u32) -> Resources {
+        Resources {
+            gpu,
+            ..of(cpu, memory)
+        }
+    }
+
+    #[test]
+    fn a_job_is_given_gpus_of_its_own_and_gives_them_back() {
+        let devices = [
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+        let mut b = Budget::new(of(8.0, 8192), 512).with_gpus(&devices);
+        assert_eq!(b.free(), gpus(8.0, 8192, 2));
+        assert_eq!(b.reserve_job(of(1.0, 256)).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            b.reserve_job(gpus(1.0, 256, 1)).unwrap(),
+            ["nvidia.com/gpu=0"]
+        );
+        let err = b.reserve_job(gpus(1.0, 256, 2)).unwrap_err();
+        assert!(
+            err.contains("2 GPU does not fit the 1 GPU free of 2"),
+            "{err}"
+        );
+        assert_eq!(b.free().gpu, 1, "a refusal changes nothing");
+        assert_eq!(
+            b.reserve_job(gpus(1.0, 256, 1)).unwrap(),
+            ["nvidia.com/gpu=1"]
+        );
+        b.release_job(gpus(1.0, 256, 1), &devices[..1]);
+        assert_eq!(
+            b.reserve_job(gpus(1.0, 256, 1)).unwrap(),
+            ["nvidia.com/gpu=0"]
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_gpus_offers_none_and_takes_no_job_asking_for_one() {
+        let mut b = Budget::new(of(8.0, 8192), 512);
+        assert_eq!(b.free().gpu, 0);
+        assert!(b.reserve_job(gpus(1.0, 256, 1)).is_err());
+    }
+
+    #[test]
+    fn a_reservation_gives_its_gpus_back_when_it_ends() {
+        let shared = Shared::new(Budget::new(of(2.0, 1024), 256).with_gpus(&["g".to_string()]));
+        let held = shared.reserve_job(gpus(1.0, 64, 1)).unwrap();
+        assert_eq!(held.gpus, ["g"]);
+        assert!(shared.reserve_job(gpus(0.5, 64, 1)).is_err());
+        drop(held);
+        assert_eq!(shared.free(), gpus(2.0, 1024, 1));
     }
 
     #[test]
@@ -271,7 +374,7 @@ mod tests {
         assert_eq!(Cpu::of(f64::NAN), Cpu::default());
         assert_eq!(
             serde_json::to_value(of(13.5, 9216)).unwrap(),
-            serde_json::json!({"cpu": 13.5, "memory": 9216})
+            serde_json::json!({"cpu": 13.5, "memory": 9216, "gpu": 0})
         );
     }
 
@@ -292,7 +395,7 @@ mod tests {
             .reserve_job(of(0.5, 16))
             .unwrap_err()
             .contains("less than any run"));
-        b.release_job(of(0.5, 1024));
+        b.release_job(of(0.5, 1024), &[]);
         assert_eq!(b.free(), of(3.0, 1536));
         assert_eq!(
             b.build_extra(256),
@@ -314,7 +417,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(b.free(), of(0.0, 6144), "a refusal changes nothing");
-        b.release_job(of(0.25, 256));
+        b.release_job(of(0.25, 256), &[]);
         assert!(b.clone().reserve_job(of(0.25, 256)).is_ok());
         assert!(b.reserve_job(of(0.3, 256)).is_err());
     }
@@ -328,7 +431,7 @@ mod tests {
             .reserve_job(of(1.0, 16))
             .unwrap_err()
             .contains("14 MiB free is less than any run"));
-        b.release_job(of(1.0, 1010));
+        b.release_job(of(1.0, 1010), &[]);
         assert_eq!(b.free(), of(16.0, 1024));
     }
 

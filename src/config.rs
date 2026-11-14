@@ -49,6 +49,9 @@ pub struct Config {
     /// Repos (`owner/name`) whose runs `onHost` this host runs on itself, as
     /// its user, outside a container; any other repo's is failed unrun.
     pub host_runs: Vec<String>,
+    /// The GPUs it offers runs, as podman CDI device names (`nvidia.com/gpu=0`),
+    /// each given whole to one run's container at a time.
+    pub gpus: Vec<String>,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -124,6 +127,8 @@ struct File {
     slice: Slice,
     #[serde(default)]
     host_runs: Vec<String>,
+    #[serde(default)]
+    gpus: Vec<String>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
@@ -276,7 +281,29 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
                 }
             })
             .collect::<Result<_, _>>()?,
+        gpus: gpus(file.gpus)?,
     })
+}
+
+/// CDI device names, each once: `vendor/class=name`, as `nvidia-ctk cdi list` prints them.
+fn gpus(devices: Vec<String>) -> Result<Vec<String>, String> {
+    for (i, d) in devices.iter().enumerate() {
+        let cdi = d.split_once('=').is_some_and(|(kind, name)| {
+            kind.contains('/') && !name.is_empty() && !d.contains(char::is_whitespace)
+        });
+        if !cdi {
+            return Err(format!(
+                "gpus {d:?} must be a CDI device name, e.g. nvidia.com/gpu=0 (see nvidia-ctk cdi list)"
+            ));
+        }
+        if devices[..i].contains(d) {
+            return Err(format!("gpus names {d:?} twice"));
+        }
+    }
+    if devices.len() > 64 {
+        return Err("gpus names more than 64".into());
+    }
+    Ok(devices)
 }
 
 impl Config {
@@ -332,8 +359,28 @@ mod tests {
                 platform: None,
                 slice: Slice::default(),
                 host_runs: vec![],
+                gpus: vec![],
             }
         );
+    }
+
+    #[test]
+    fn gpus_are_cdi_device_names_each_once() {
+        let with = |list: &str| read(&format!("{BASE}gpus = {list}\n"));
+        assert_eq!(
+            with("[\"nvidia.com/gpu=0\", \"nvidia.com/gpu=1\"]")
+                .unwrap()
+                .gpus,
+            ["nvidia.com/gpu=0", "nvidia.com/gpu=1"]
+        );
+        for bad in [
+            "[\"0\"]",
+            "[\"nvidia.com/gpu=\"]",
+            "[\"gpu=0\"]",
+            "[\"a/b=0\", \"a/b=0\"]",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -375,6 +422,7 @@ mod tests {
         let offered = Resources {
             cpu: crate::budget::Cpu::of(13.5),
             memory: 9216,
+            gpu: 0,
         };
         let unit = Slice::default().unit(offered);
         assert!(unit.contains("MemoryMax=9216M\n"), "{unit}");

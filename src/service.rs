@@ -175,6 +175,9 @@ pub struct Requirements {
     #[serde(default)]
     pub cpu: Option<f64>,
     pub memory: Option<u64>,
+    /// Whole GPUs; absent from a jobber before GPUs.
+    #[serde(default)]
+    pub gpu: Option<u32>,
     pub timeout: Option<u64>,
 }
 
@@ -215,6 +218,8 @@ pub struct Assignment {
     pub cpu: Cpu,
     /// MiB it was admitted with: reserved, and its ceiling.
     pub memory: u64,
+    /// The GPUs it holds, as podman CDI device names: its container's `--device`s.
+    pub gpus: Vec<String>,
     /// Seconds it lives without a heartbeat listing it.
     pub lease: u64,
     pub secrets: Secrets,
@@ -538,7 +543,7 @@ mod tests {
     fn a_host_registers_with_what_it_is_and_has() {
         let (url, server) = serve(vec![(
             "201 Created",
-            r#"{"host":{"id":"h1","name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216},"labels":{},"version":"v","free":null,"metrics":null,"createdAt":"","lastSeenAt":""},"token":"h1.secret"}"#,
+            r#"{"host":{"id":"h1","name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216,"gpu":0},"labels":{},"version":"v","free":null,"metrics":null,"createdAt":"","lastSeenAt":""},"token":"h1.secret"}"#,
         )]);
         let labels = BTreeMap::from([("gpu".to_string(), "none".to_string())]);
         let registered = register_host(
@@ -551,6 +556,7 @@ mod tests {
                 capacity: Resources {
                     cpu: Cpu::of(13.5),
                     memory: 9216,
+                    gpu: 0,
                 },
                 labels: &labels,
                 version: "0.1.0",
@@ -567,7 +573,7 @@ mod tests {
         assert!(sent[0].head.contains("Authorization: Bearer reg"));
         assert_eq!(
             sent[0].json(),
-            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216},"labels":{"gpu":"none"},"version":"0.1.0","features":["secrets","hostRuns"]})
+            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216,"gpu":0},"labels":{"gpu":"none"},"version":"0.1.0","features":["secrets","hostRuns"]})
         );
     }
 
@@ -584,6 +590,7 @@ mod tests {
             Requirements {
                 cpu: Some(0.25),
                 memory: Some(512),
+                gpu: None,
                 timeout: None
             }
         );
@@ -712,6 +719,7 @@ mod tests {
             free: Resources {
                 cpu: Cpu::of(0.0),
                 memory: 512,
+                gpu: 0,
             },
             metrics: Metrics {
                 cpu_load: 1.5,
@@ -768,7 +776,7 @@ mod tests {
         assert!(sent[0].head.contains("Authorization: Bearer h1.secret"));
         assert_eq!(
             sent[0].json(),
-            json!({"free":{"cpu":0.0,"memory":512},"metrics":{"cpuLoad":1.5,"memoryUsed":1000,"memoryTotal":4000,"diskFree":9000,"cpus":4},"running":["j1","j2"]})
+            json!({"free":{"cpu":0.0,"memory":512,"gpu":0},"metrics":{"cpuLoad":1.5,"memoryUsed":1000,"memoryTotal":4000,"diskFree":9000,"cpus":4},"running":["j1","j2"]})
         );
     }
 
@@ -802,6 +810,7 @@ mod tests {
                 free: Resources {
                     cpu: Cpu::of(1.0),
                     memory: 16,
+                    gpu: 0,
                 },
                 metrics: Metrics {
                     cpu_load: 0.0,
@@ -846,6 +855,7 @@ mod tests {
             free: Resources {
                 cpu: Cpu::of(0.0),
                 memory: 0,
+                gpu: 0,
             },
             metrics: none,
             running: &running,

@@ -108,7 +108,13 @@ fn main() -> ExitCode {
     let (measured, offered) = match capacity::measure().and_then(|m| {
         capacity::allocatable(m, &config.reserve, config.job_memory_overhead).map(|a| (m, a))
     }) {
-        Ok(both) => both,
+        Ok((measured, offered)) => (
+            measured,
+            Resources {
+                gpu: config.gpus.len() as u32,
+                ..offered
+            },
+        ),
         Err(e) => {
             log!("jobber-host: {e}");
             return ExitCode::from(2);
@@ -138,12 +144,17 @@ fn main() -> ExitCode {
     };
     sys::handle_signals();
     log!(
-        "jobber-host {VERSION}: {} for {}, {} CPU and {} MiB ({} MiB per image build), labels {:?}, containers in {}",
+        "jobber-host {VERSION}: {} for {}, {} CPU and {} MiB ({} MiB per image build), {}, labels {:?}, containers in {}",
         config.name,
         config.service,
         offered.cpu,
         offered.memory,
         build_memory(&config, offered),
+        if config.gpus.is_empty() {
+            "no GPUs".to_string()
+        } else {
+            format!("GPUs {}", config.gpus.join(" "))
+        },
         config.labels,
         config.cgroup_parent.as_deref().unwrap_or("podman's default cgroup")
     );
@@ -197,7 +208,8 @@ fn build_memory(config: &Config, offered: Resources) -> u64 {
 fn budget(config: &Config, offered: Resources) -> Shared {
     Shared::new(
         Budget::new(offered, build_memory(config, offered))
-            .with_overhead(config.job_memory_overhead),
+            .with_overhead(config.job_memory_overhead)
+            .with_gpus(&config.gpus),
     )
 }
 

@@ -16,6 +16,7 @@ pub fn measure() -> Result<Resources, String> {
     Ok(Resources {
         cpu: Cpu::of(cpus as f64),
         memory,
+        gpu: 0,
     })
 }
 
@@ -29,6 +30,7 @@ pub fn allocatable(
     let offered = Resources {
         cpu: measured.cpu.saturating_sub(Cpu::of(reserve.cpu)),
         memory: measured.memory.saturating_sub(reserve.memory),
+        gpu: measured.gpu,
     };
     if offered.cpu == Cpu::default() {
         return Err(format!(
@@ -107,6 +109,7 @@ mod tests {
         Resources {
             cpu: Cpu::of(cpu),
             memory,
+            gpu: 0,
         }
     }
 

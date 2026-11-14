@@ -60,6 +60,7 @@ pub struct Podman<S: Service> {
 #[serde(deny_unknown_fields)]
 struct Defaults {
     memory: Option<u64>,
+    gpu: Option<u32>,
     timeout: Option<u64>,
     stall: Option<u64>,
 }
@@ -69,6 +70,8 @@ struct Defaults {
 struct JobDef {
     run: Vec<String>,
     memory: Option<u64>,
+    /// Whole GPUs its container is given, each its own.
+    gpu: Option<u32>,
     timeout: Option<u64>,
     /// Seconds without progress before it is ended as stalled; 0 for never.
     stall: Option<u64>,
@@ -100,6 +103,8 @@ pub struct Plan {
     pub memory: u64,
     /// CPUs its container may use, as admitted.
     pub cpu: crate::budget::Cpu,
+    /// The GPUs its container is given, as CDI device names.
+    pub gpus: Vec<String>,
     pub timeout: u64,
     /// Seconds without progress before it is ended as stalled; None for never.
     pub stall: Option<u64>,
@@ -137,6 +142,17 @@ pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
             run.memory
         ));
     }
+    let gpu = requirements
+        .gpu
+        .or(def.gpu)
+        .or(file.defaults.gpu)
+        .unwrap_or(0);
+    if gpu as usize > run.gpus.len() {
+        return Err(format!(
+            "jobs.toml gives it {gpu} GPU, over the {} it was admitted with: submit it with requirements.gpu = {gpu}",
+            run.gpus.len()
+        ));
+    }
     let timeout = requirements
         .timeout
         .or(def.timeout)
@@ -153,6 +169,7 @@ pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
         run: command,
         memory,
         cpu: run.cpu,
+        gpus: run.gpus[..gpu as usize].to_vec(),
         timeout,
         stall,
         credentials,
@@ -184,9 +201,14 @@ pub fn launch_line(plan: &Plan) -> String {
         );
     }
     format!(
-        "running with {} CPU, {} MiB, a {}s timeout and {}{}{}: {}",
+        "running with {} CPU, {} MiB, {}a {}s timeout and {}{}{}: {}",
         plan.cpu,
         plan.memory,
+        if plan.gpus.is_empty() {
+            String::new()
+        } else {
+            format!("GPUs {}, ", plan.gpus.join(" "))
+        },
         plan.timeout,
         plan.stall.map_or("no stall limit".to_string(), |s| format!(
             "a {s}s stall limit"
@@ -1030,6 +1052,7 @@ impl<S: Service> Podman<S> {
                     (plan.cpu > crate::budget::Cpu::default())
                         .then(|| format!("--cpus={}", plan.cpu)),
                 )
+                .args(plan.gpus.iter().map(|d| format!("--device={d}")))
                 .args(["--userns=keep-id:uid=1000,gid=1000", "-w", "/work"])
                 .arg("-v")
                 // Writable, so installs and build output land beside the sources; the
@@ -1442,6 +1465,7 @@ pub(crate) mod tests {
                 requirements: Requirements {
                     cpu: None,
                     memory,
+                    gpu: None,
                     timeout,
                 },
                 labels: BTreeMap::new(),
@@ -1449,6 +1473,7 @@ pub(crate) mod tests {
             },
             cpu: Cpu::of(0.5),
             memory: admitted,
+            gpus: vec![],
             lease: 60,
             secrets: Default::default(),
         }
@@ -1459,6 +1484,7 @@ pub(crate) mod tests {
             Resources {
                 cpu: Cpu::of(cpu),
                 memory,
+                gpu: 0,
             },
             build_memory,
         ))
@@ -1487,6 +1513,7 @@ run = ["python", "jobs/plain.py"]
                 run: vec!["python".into(), "jobs/hello.py".into(), "x".into()],
                 memory: 256,
                 cpu: Cpu::of(0.5),
+                gpus: vec![],
                 timeout: 60,
                 stall: Some(DEFAULT_STALL),
                 credentials: vec![],
@@ -1629,6 +1656,38 @@ run = ["python", "jobs/plain.py"]
     }
 
     #[test]
+    fn a_job_gets_the_gpus_jobs_toml_or_its_submitter_asks_for_and_no_more_than_it_holds() {
+        let toml = "[defaults]\ngpu = 1\n[jobs.train]\nrun = [\"python\", \"train.py\"]\ngpu = 2\n\
+                    [jobs.eval]\nrun = [\"python\", \"eval.py\"]\n[jobs.cpu]\nrun = [\"true\"]\ngpu = 0\n";
+        let holding = |job: &str, gpus: &[&str], asked: Option<u32>| {
+            let mut a = assignment(job, None, None, 1024);
+            a.gpus = gpus.iter().map(|g| g.to_string()).collect();
+            a.run.requirements.gpu = asked;
+            plan(toml, &a)
+        };
+        let two = ["nvidia.com/gpu=0", "nvidia.com/gpu=1"];
+        assert_eq!(holding("train", &two, None).unwrap().gpus, two);
+        assert_eq!(
+            holding("eval", &two, Some(2)).unwrap().gpus,
+            two,
+            "the submitter's"
+        );
+        assert_eq!(
+            holding("eval", &two[..1], Some(1)).unwrap().gpus,
+            two[..1],
+            "the defaults'"
+        );
+        assert!(holding("cpu", &[], None).unwrap().gpus.is_empty());
+        let err = holding("train", &[], None).unwrap_err();
+        assert!(err.contains("submit it with requirements.gpu = 2"), "{err}");
+        let line = launch_line(&holding("train", &two, None).unwrap());
+        assert!(
+            line.contains("GPUs nvidia.com/gpu=0 nvidia.com/gpu=1, a "),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn a_job_a_job_runner_runs_on_its_host_itself_is_refused_not_run_in_a_container() {
         let e = plan(
             "[jobs.restart]\nrun = [\"x\"]\nhost = \"laptop\"\n",
@@ -1746,6 +1805,7 @@ run = ["python", "jobs/plain.py"]
             .reserve_job(Resources {
                 cpu: Cpu::of(0.5),
                 memory: 1024,
+                gpu: 0,
             })
             .unwrap();
         let log = Log::start(podman.service.clone(), run.run.id.clone());
@@ -1828,6 +1888,7 @@ run = ["python", "jobs/plain.py"]
             ],
             memory: 64,
             cpu: Cpu::of(0.5),
+            gpus: vec![],
             timeout: 1,
             stall: None,
             credentials: vec![],
@@ -2137,6 +2198,7 @@ run = ["python", "jobs/plain.py"]
             .reserve_job(crate::budget::Resources {
                 cpu: Cpu::of(1.0),
                 memory: 256,
+                gpu: 0,
             })
             .unwrap();
         let log = Log::start(service.clone(), "j".into());
@@ -2197,6 +2259,7 @@ run = ["python", "jobs/plain.py"]
             ],
             memory: 64,
             cpu: Cpu::of(0.5),
+            gpus: vec![],
             timeout: 60,
             stall: None,
             credentials: vec![],
@@ -2259,6 +2322,7 @@ run = ["python", "jobs/plain.py"]
                 ],
                 memory: 64,
                 cpu: Cpu::of(0.5),
+                gpus: vec![],
                 timeout: 60,
                 stall: None,
                 credentials: vec![],
@@ -2324,6 +2388,7 @@ run = ["python", "jobs/plain.py"]
             run: vec!["sh".into(), "-c".into(), script.into()],
             memory: 64,
             cpu: Cpu::of(0.5),
+            gpus: vec![],
             timeout: 600,
             stall: Some(stall),
             credentials: vec![],
@@ -2341,6 +2406,48 @@ run = ["python", "jobs/plain.py"]
         );
         log.close(Duration::from_secs(5));
         (outcome, started.elapsed())
+    }
+
+    /// Needs rootless podman and, in `JOBBER_HOST_TEST_GPU`, a CDI device
+    /// podman can give (`nvidia.com/gpu=0`); passes without one.
+    #[test]
+    #[ignore]
+    fn a_job_given_a_gpu_sees_it_in_its_container() {
+        let Ok(device) = std::env::var("JOBBER_HOST_TEST_GPU") else {
+            return;
+        };
+        let image = "docker.io/library/ubuntu:24.04";
+        assert!(Command::new("podman")
+            .args(["pull", "-q", image])
+            .status()
+            .unwrap()
+            .success());
+        let podman = busybox_podman();
+        let log = Log::start(podman.service.clone(), "j".into());
+        let plan = Plan {
+            run: vec!["nvidia-smi".into(), "-L".into()],
+            memory: 256,
+            cpu: Cpu::of(0.5),
+            gpus: vec![device.clone()],
+            timeout: 120,
+            stall: None,
+            credentials: vec![],
+            secrets: vec![],
+            on_host: false,
+        };
+        let outcome = podman.contain(
+            &log,
+            image,
+            &plan,
+            &[],
+            &std::env::temp_dir(),
+            &format!("job-gpu-{}", std::process::id()),
+        );
+        log.close(Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&podman.service.0.lock().unwrap()).to_string();
+        assert!(matches!(outcome.state, End::Succeeded), "{text}");
+        assert!(text.contains(&format!("GPUs {device}, ")), "{text}");
+        assert!(text.contains("GPU 0: "), "{text}");
     }
 
     /// Needs rootless podman: `cargo test -- --ignored`.
@@ -2457,6 +2564,7 @@ run = ["python", "jobs/plain.py"]
             run: vec!["sleep".into(), "30".into()],
             memory: 64,
             cpu: Cpu::of(0.5),
+            gpus: vec![],
             timeout: 120,
             stall: None,
             credentials: vec![],
@@ -2535,6 +2643,7 @@ run = ["python", "jobs/plain.py"]
             run: vec!["sh".into(), "-c".into(), "sleep 2; tail /dev/zero".into()],
             memory: 4096,
             cpu: Cpu::of(0.5),
+            gpus: vec![],
             timeout: 120,
             stall: None,
             credentials: vec![],
@@ -2654,6 +2763,7 @@ run = ["python", "jobs/plain.py"]
             .reserve_job(crate::budget::Resources {
                 cpu: Cpu::of(1.0),
                 memory: 256,
+                gpu: 0,
             })
             .unwrap();
         hosts.begin(&id, 1);

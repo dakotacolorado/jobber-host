@@ -64,6 +64,30 @@ its log ends `[jobber-host] succeeded with exit 0`. The first run builds
 `localhost/base-<name>:<n>` from its tag and the repo's image, which takes a
 minute or two; later runs reuse both.
 
+## GPUs
+
+A host offers only the GPUs its config's `gpus` names, as podman CDI device
+names; it gives each run asking for GPUs its own, as `--device`, and no other
+run has them meanwhile. For NVIDIA:
+
+1. **The NVIDIA Container Toolkit**, and a CDI spec of the machine's GPUs:
+   `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, then
+   `nvidia-ctk cdi list` names them.
+2. **Podman reads the spec**:
+   `podman run --rm --device nvidia.com/gpu=all ubuntu nvidia-smi -L` lists
+   them. Ubuntu 24.04's podman 4.9 cannot read a spec of `cdiVersion` 0.7.0
+   (`unresolvable CDI devices`, and in `--log-level=debug` `unknown field
+   "additionalGids"`): delete each `additionalGids` list, which grants only
+   `/dev/dri`'s groups and not CUDA's world-writable `/dev/nvidia*`, and set
+   `cdiVersion: 0.6.0`. Do it again whenever the spec is generated again.
+3. **Name them** in `~/.config/jobber-host/config.toml`, by index rather than
+   `all`, so runs can hold them one at a time:
+   `gpus = ["nvidia.com/gpu=0"]`, then run `scripts/install.sh` again. Its log
+   says `GPUs nvidia.com/gpu=0`, and jobber lists the host's capacity with
+   `1 GPU`.
+
+A mac's podman machine has no GPU to give.
+
 ## A mac
 
 A mac runs containers in a `podman machine`, a Linux VM, under launchd; it has

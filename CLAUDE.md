@@ -7,7 +7,8 @@ runtime or in code, and it installs beside one without touching it.
 ## What it does, and nothing more
 
 Measure the machine, register with jobber what it offers (its CPUs and
-memory, cgroup limits included, less the config's `reserve`), hold the one
+memory, cgroup limits included, less the config's `reserve`, and the GPUs its
+config's `gpus` names), hold the one
 connection jobber pushes runs over, accept what fits its budget, run each in
 its repo's podman image (or, for a run `onHost` of a repo on the config's
 `host_runs`, on the machine itself), give it the secrets its start carries as
