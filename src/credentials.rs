@@ -35,7 +35,7 @@ impl Kind {
 /// (masked in the log). A region is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Var {
-    pub name: &'static str,
+    pub name: std::borrow::Cow<'static, str>,
     pub value: String,
     pub secret: bool,
 }
@@ -114,19 +114,19 @@ pub fn aws_vars(exported: &str, region: Option<&str>) -> Result<Vec<Var>, String
         .map_err(|e| format!("aws configure export-credentials: unreadable output: {e}"))?;
     let mut vars = vec![
         Var {
-            name: "AWS_ACCESS_KEY_ID",
+            name: "AWS_ACCESS_KEY_ID".into(),
             value: e.access_key_id,
             secret: true,
         },
         Var {
-            name: "AWS_SECRET_ACCESS_KEY",
+            name: "AWS_SECRET_ACCESS_KEY".into(),
             value: e.secret_access_key,
             secret: true,
         },
     ];
     if let Some(token) = e.session_token.filter(|t| !t.is_empty()) {
         vars.push(Var {
-            name: "AWS_SESSION_TOKEN",
+            name: "AWS_SESSION_TOKEN".into(),
             value: token,
             secret: true,
         });
@@ -134,7 +134,7 @@ pub fn aws_vars(exported: &str, region: Option<&str>) -> Result<Vec<Var>, String
     if let Some(region) = region.filter(|r| !r.is_empty()) {
         for name in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
             vars.push(Var {
-                name,
+                name: name.into(),
                 value: region.to_string(),
                 secret: false,
             });
@@ -163,7 +163,7 @@ impl Source for Host {
                 Ok(["GH_TOKEN", "GITHUB_TOKEN"]
                     .into_iter()
                     .map(|name| Var {
-                        name,
+                        name: name.into(),
                         value: token.clone(),
                         secret: true,
                     })
@@ -184,7 +184,7 @@ mod tests {
             Some("us-east-1"),
         )
         .unwrap();
-        let names: Vec<_> = vars.iter().map(|v| (v.name, v.secret)).collect();
+        let names: Vec<_> = vars.iter().map(|v| (&*v.name, v.secret)).collect();
         assert_eq!(
             names,
             [

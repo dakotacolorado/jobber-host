@@ -9,11 +9,14 @@ runtime or in code, and it installs beside one without touching it.
 Measure the machine, register with jobber what it offers (its CPUs and
 memory, cgroup limits included, less the config's `reserve`), hold the one
 connection jobber pushes runs over, accept what fits its budget, run each in
-its repo's podman image, stream its log, report its end. What a run runs is its
+its repo's podman image (or, for a run `onHost` of a repo on the config's
+`host_runs`, on the machine itself), give it the secrets its start carries as
+environment variables, stream its log, report its end. What a run runs is its
 repo's `jobs.toml`; what it is sent is jobber's to decide. jobber's
 `openapi.json` and `docs/PROTOCOL.md` are the protocol; this follows their
-shapes. It speaks that protocol only: there is no other mode, no claiming,
-and no run on the host itself.
+shapes. It speaks that protocol only: there is no other mode and no claiming.
+A secret is never logged or written to disk: `service::Secrets` prints only
+names.
 
 `src/service.rs` is jobber's HTTP half (register, log appends, completions,
 the HTTP heartbeat), `src/connection.rs` the WebSocket it is pushed runs over,

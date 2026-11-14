@@ -46,6 +46,9 @@ pub struct Config {
     /// on an arm64 mac whose podman machine runs amd64 through Rosetta; none: the host's own.
     pub platform: Option<String>,
     pub slice: Slice,
+    /// Repos (`owner/name`) whose runs `onHost` this host runs on itself, as
+    /// its user, outside a container; any other repo's is failed unrun.
+    pub host_runs: Vec<String>,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -119,6 +122,8 @@ struct File {
     platform: Option<String>,
     #[serde(default)]
     slice: Slice,
+    #[serde(default)]
+    host_runs: Vec<String>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
@@ -252,6 +257,25 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
             None => None,
         },
         slice: file.slice,
+        host_runs: file
+            .host_runs
+            .into_iter()
+            .map(|repo| {
+                let mut parts = repo.split('/');
+                let ok = |p: Option<&str>| {
+                    p.is_some_and(|p| {
+                        !p.is_empty()
+                            && p.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+                    })
+                };
+                if ok(parts.next()) && ok(parts.next()) && parts.next().is_none() {
+                    Ok(repo)
+                } else {
+                    Err(format!("host_runs {repo:?} must be a repo, owner/name"))
+                }
+            })
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -307,6 +331,7 @@ mod tests {
                 cgroup_parent: Some("jobber.slice".into()),
                 platform: None,
                 slice: Slice::default(),
+                host_runs: vec![],
             }
         );
     }
@@ -363,6 +388,18 @@ mod tests {
     }
 
     #[test]
+    fn host_runs_names_repos_and_nothing_else() {
+        let with = |list: &str| read(&format!("{BASE}host_runs = {list}\n"));
+        assert_eq!(
+            with("[\"a/b\", \"c-d/e.f\"]").unwrap().host_runs,
+            ["a/b", "c-d/e.f"]
+        );
+        for bad in ["[\"a\"]", "[\"a/b/c\"]", "[\"/b\"]", "[\"a/b c\"]"] {
+            assert!(with(bad).unwrap_err().contains("must be a repo"), "{bad}");
+        }
+    }
+
+    #[test]
     fn every_setting_can_be_given() {
         let config = read(
             "service = \"http://localhost:4500\"\nregistration_token_file = \"/etc/jh/reg\"\n\
@@ -370,7 +407,7 @@ mod tests {
              reserve = { cpu = 0.5, memory = 512 }\nbuild_memory = 256\njob_memory_overhead = 64\n\
              work_dir = \"/srv/jh\"\ngit_credential_helper = \"!gh auth git-credential\"\n\
              base_owner = \"me\"\nstop_grace_seconds = 3\ncgroup_parent = \"mine.slice\"\n\
-             platform = \"linux/amd64\"\n[slice]\nmemory_max = \"1G\"\ncpu_weight = 50\n",
+             platform = \"linux/amd64\"\nhost_runs = [\"o/deploy-routines\"]\n[slice]\nmemory_max = \"1G\"\ncpu_weight = 50\n",
         )
         .unwrap();
         assert_eq!(config.registration_token_file, PathBuf::from("/etc/jh/reg"));
@@ -395,6 +432,7 @@ mod tests {
         );
         assert_eq!(config.cgroup_parent.as_deref(), Some("mine.slice"));
         assert_eq!(config.platform.as_deref(), Some("linux/amd64"));
+        assert_eq!(config.host_runs, ["o/deploy-routines"]);
         assert_eq!(
             config.slice,
             Slice {

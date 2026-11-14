@@ -58,6 +58,27 @@ run = ["python", "jobs/hello.py"]
 stall = 120       # seconds without output, CPU or network before it is ended; 0 for never
 ```
 
+A run may name **secrets**, set in jobber by its admin: jobber sends their
+values with the message that starts the run, and jobber-host gives each to the
+run as an environment variable of its name (to podman by name alone, so no
+value is on a command line), masks every value in its log, and keeps them in
+memory only, never in its own log or on disk.
+
+### Runs on the host itself
+
+A run submitted `onHost` with `requirements.host` naming this host runs on the
+machine itself, not in a container: as the user jobber-host runs as, with its
+checkout as the working directory, with that user's `PATH`, `HOME` and
+session plus the run's secrets and credentials as its environment. Its log,
+timeout, cancel and exit are a container run's; it has no CPU or memory cap
+and no stall limit. On a cancel or timeout its whole process group gets
+SIGTERM, then SIGKILL after `stop_grace_seconds`; whatever is left in that
+group when it ends is killed too. jobber-host runs one only for a repo in its
+config's `host_runs`; any other is failed before it is checked out, with the
+refusal as its reason. jobber-host tells jobber it can take secrets and host
+runs (`features` when it registers), and jobber sends neither to a host that
+does not say so.
+
 ## Config
 
 `~/.config/jobber-host/config.toml` (or `$XDG_CONFIG_HOME/jobber-host/`),
@@ -77,6 +98,7 @@ job_memory_overhead = 0                        # MiB each container gets beyond 
 cgroup_parent = "jobber.slice"                 # the systemd user slice containers run in; "" for podman's default
 platform = "linux/amd64"                       # optional: every image pulled, built and run as this
 git_credential_helper = "!gh auth git-credential"  # optional, for private repos
+host_runs = ["owner/deploy-routines"]          # optional: repos whose runs onHost run on this host itself
 
 [slice]                                        # the slice's unit, as `jobber-host --slice-unit` writes it
 memory_max = "8G"                              # default: what it offers

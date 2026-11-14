@@ -1,6 +1,6 @@
 [package]
 name = "jobber-host"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Runs jobber's runs on a computer, each in its repo's rootless podman image."
 license = "MIT"

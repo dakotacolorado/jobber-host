@@ -50,6 +50,8 @@ pub struct Podman<S: Service> {
     /// One image build at a time.
     pub building: Mutex<()>,
     pub stopping: fn() -> bool,
+    /// Repos whose runs `onHost` it runs on this host itself: the config's `host_runs`.
+    pub host_runs: Vec<String>,
 }
 
 // --- jobs.toml ---------------------------------------------------------------
@@ -102,6 +104,10 @@ pub struct Plan {
     /// Seconds without progress before it is ended as stalled; None for never.
     pub stall: Option<u64>,
     pub credentials: Vec<Kind>,
+    /// The names of the secrets jobber sent with its start.
+    pub secrets: Vec<String>,
+    /// Runs on this host itself, not in a container.
+    pub on_host: bool,
 }
 
 pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
@@ -116,7 +122,7 @@ pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
     }
     if let Some(host) = &def.host {
         return Err(format!(
-            "[jobs.{name}] runs on host {host} itself, which jobber does not do: jobber-host runs every run in its repo's container"
+            "[jobs.{name}] names host {host}, which jobber-host does not read: submit the run onHost with requirements.host = {host:?}"
         ));
     }
     let requirements = &run.run.requirements;
@@ -150,14 +156,35 @@ pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
         timeout,
         stall,
         credentials,
+        secrets: run.secrets.0.keys().cloned().collect(),
+        on_host: run.run.on_host,
     })
 }
 
 /// The log's line for a job's start: its limits first, so a long command
 /// cut off where the line is shown cannot hide them.
 pub fn launch_line(plan: &Plan) -> String {
+    let given = if plan.secrets.is_empty() {
+        String::new()
+    } else {
+        format!(", given secrets {}", plan.secrets.join(", "))
+    };
+    if plan.on_host {
+        return format!(
+            "running on this host itself, as its user, with a {}s timeout{}{}: {}",
+            plan.timeout,
+            if plan.credentials.is_empty() {
+                String::new()
+            } else {
+                let kinds: Vec<_> = plan.credentials.iter().map(|k| k.name()).collect();
+                format!(", sent the host's {} credentials", kinds.join(" and "))
+            },
+            given,
+            plan.run.join(" ")
+        );
+    }
     format!(
-        "running with {} CPU, {} MiB, a {}s timeout and {}{}: {}",
+        "running with {} CPU, {} MiB, a {}s timeout and {}{}{}: {}",
         plan.cpu,
         plan.memory,
         plan.timeout,
@@ -170,6 +197,7 @@ pub fn launch_line(plan: &Plan) -> String {
             let kinds: Vec<_> = plan.credentials.iter().map(|k| k.name()).collect();
             format!(", sent the host's {} credentials", kinds.join(" and "))
         },
+        given,
         plan.run.join(" ")
     )
 }
@@ -911,6 +939,14 @@ impl<S: Service> Podman<S> {
     ) -> Outcome {
         let id = &run.run.id;
         let dir = self.work_dir.join(id);
+        if run.run.on_host && !may_run_on_host(&self.host_runs, &run.run.repo) {
+            let why = format!(
+                "refused: {} may not run on this host itself, as it is not on this host's host_runs",
+                run.run.repo
+            );
+            log.say(&why);
+            return Outcome::failed(why);
+        }
         log.say(&format!(
             "checking out {} at {}",
             run.run.repo, run.run.commit
@@ -929,22 +965,31 @@ impl<S: Service> Podman<S> {
                 return Outcome::failed(e);
             }
         };
-        let tag = match self.image(log, run, &dir, &run.run.repo, job, budget) {
-            Ok(tag) => tag,
-            Err(outcome) => {
-                if let Some(why) = &outcome.reason {
-                    log.say(why);
+        let tag = if plan.on_host {
+            None
+        } else {
+            match self.image(log, run, &dir, &run.run.repo, job, budget) {
+                Ok(tag) => Some(tag),
+                Err(outcome) => {
+                    if let Some(why) = &outcome.reason {
+                        log.say(why);
+                    }
+                    return outcome;
                 }
-                return outcome;
             }
         };
-        let env = match credentials::gather(&*self.credentials, run, &plan.credentials) {
+        let mut env = match credentials::gather(&*self.credentials, run, &plan.credentials) {
             Ok(env) => env,
             Err(e) => {
                 log.say(&e);
                 return Outcome::failed(e);
             }
         };
+        env.extend(run.secrets.0.iter().map(|(name, value)| Var {
+            name: name.clone().into(),
+            value: value.clone(),
+            secret: true,
+        }));
         log.mask(env.iter().filter(|v| v.secret).map(|v| v.value.clone()));
         if log.canceled() {
             return Outcome {
@@ -953,7 +998,10 @@ impl<S: Service> Podman<S> {
                 reason: Some("canceled before it started".into()),
             };
         }
-        self.contain(log, &tag, &plan, &env, &dir, &format!("job-{id}"))
+        match tag {
+            None => self.on_host(log, &plan, &env, &dir),
+            Some(tag) => self.contain(log, &tag, &plan, &env, &dir, &format!("job-{id}")),
+        }
     }
 
     /// Runs the job's container, `name`, to its end, stopping it for a
@@ -991,7 +1039,7 @@ impl<S: Service> Podman<S> {
                 cmd.arg(format!("--cgroup-parent={parent}"));
             }
             for var in env {
-                cmd.arg("--env").arg(var.name).env(var.name, &var.value);
+                cmd.arg("--env").arg(&*var.name).env(&*var.name, &var.value);
             }
             cmd.arg(tag).args(&plan.run);
             cmd
@@ -1044,36 +1092,7 @@ impl<S: Service> Podman<S> {
                 }
             }
             if stopped.is_none() {
-                let why = if log.canceled() {
-                    Some(Outcome {
-                        state: End::Canceled,
-                        exit: None,
-                        reason: None,
-                    })
-                } else if started.elapsed() > Duration::from_secs(plan.timeout) {
-                    Some(Outcome::failed(format!(
-                        "timed out after {}s",
-                        plan.timeout
-                    )))
-                } else if let Some(idle) = stalled {
-                    Some(Outcome::failed(format!(
-                        "stalled: no output, under 10% of a CPU and under 1 KiB of network every {}s, for {}s (its stall limit is {}s)",
-                        SAMPLE.as_secs(),
-                        idle.as_secs(),
-                        plan.stall.unwrap_or_default()
-                    )))
-                } else if let Some(why) = log.ended() {
-                    Some(Outcome::failed(format!("jobber ended it: {why}")))
-                } else if (self.stopping)() {
-                    Some(Outcome::failed("jobber-host was stopped"))
-                } else {
-                    None
-                };
-                if let Some(outcome) = why {
-                    log.say(&format!(
-                        "stopping it: {}",
-                        outcome.reason.as_deref().unwrap_or("canceled")
-                    ));
+                if let Some(outcome) = self.stop_for(log, started, plan, stalled) {
                     let mut stop = clean("podman");
                     stop.args(["stop", "-t", &self.grace.as_secs().to_string(), name]);
                     let _ = stop.stdout(Stdio::null()).stderr(Stdio::null()).status();
@@ -1109,32 +1128,162 @@ impl<S: Service> Podman<S> {
             };
         }
         match exit {
-            Some(0) => Outcome {
-                state: End::Succeeded,
-                exit,
-                reason: None,
-            },
-            Some(code) => {
-                let why = if code == 137 {
-                    format!(
-                        "killed (exit 137): most likely past its {} MiB memory limit",
-                        plan.memory + self.memory_overhead
-                    )
-                } else {
-                    format!("exited {code}")
-                };
-                Outcome {
-                    state: End::Failed,
-                    exit,
-                    reason: Some(match log.last_line() {
-                        Some(line) => format!("{why}; its last line: {line}"),
-                        None => why,
-                    }),
-                }
+            Some(137) => {
+                let why = format!(
+                    "killed (exit 137): most likely past its {} MiB memory limit",
+                    plan.memory + self.memory_overhead
+                );
+                exited(log, 137, why)
             }
+            Some(code) => exited(log, code, format!("exited {code}")),
             None => Outcome::failed("podman run ended without an exit code"),
         }
     }
+
+    /// Why a running job is to be stopped now, if it is: a cancel, its
+    /// timeout, a stall, jobber ending it, or jobber-host stopping. Said in its log.
+    fn stop_for(
+        &self,
+        log: &Log,
+        started: Instant,
+        plan: &Plan,
+        stalled: Option<Duration>,
+    ) -> Option<Outcome> {
+        let why = if log.canceled() {
+            Outcome {
+                state: End::Canceled,
+                exit: None,
+                reason: None,
+            }
+        } else if started.elapsed() > Duration::from_secs(plan.timeout) {
+            Outcome::failed(format!("timed out after {}s", plan.timeout))
+        } else if let Some(idle) = stalled {
+            Outcome::failed(format!(
+                "stalled: no output, under 10% of a CPU and under 1 KiB of network every {}s, for {}s (its stall limit is {}s)",
+                SAMPLE.as_secs(),
+                idle.as_secs(),
+                plan.stall.unwrap_or_default()
+            ))
+        } else if let Some(why) = log.ended() {
+            Outcome::failed(format!("jobber ended it: {why}"))
+        } else if (self.stopping)() {
+            Outcome::failed("jobber-host was stopped")
+        } else {
+            return None;
+        };
+        log.say(&format!(
+            "stopping it: {}",
+            why.reason.as_deref().unwrap_or("canceled")
+        ));
+        Some(why)
+    }
+
+    /// Runs the job on this host itself, as its user, in its checkout, with
+    /// `env` added to the user's own: no container, so no CPU or memory cap
+    /// and no stall watch. Its process group is killed when it is stopped
+    /// (SIGTERM, then SIGKILL after the grace) and when it ends, so nothing it
+    /// started there outlives it.
+    fn on_host(&self, log: &Log, plan: &Plan, env: &[Var], dir: &Path) -> Outcome {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut cmd = clean(&plan.run[0]);
+        cmd.args(&plan.run[1..]).current_dir(dir).process_group(0);
+        for var in env {
+            cmd.env(&*var.name, &var.value);
+        }
+        log.say(&launch_line(plan));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let why = format!("could not start {}: {e}", plan.run[0]);
+                log.say(&why);
+                return Outcome::failed(why);
+            }
+        };
+        let group = child.id() as i32;
+        let readers = pipe(log, &mut child);
+        let started = Instant::now();
+        let mut stopped: Option<(Outcome, Instant)> = None;
+        let mut killed = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(e) => break Err(e),
+                Ok(None) => {}
+            }
+            match &stopped {
+                None => {
+                    if let Some(outcome) = self.stop_for(log, started, plan, None) {
+                        signal_group(group, SIGTERM);
+                        stopped = Some((outcome, Instant::now()));
+                    }
+                }
+                Some((_, at)) if !killed && at.elapsed() >= self.grace => {
+                    signal_group(group, SIGKILL);
+                    killed = true;
+                }
+                Some(_) => {}
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        // What it left running in its group would hold the log's pipes open.
+        signal_group(group, SIGKILL);
+        for r in readers {
+            let _ = r.join();
+        }
+        let exit = status
+            .ok()
+            .and_then(|s| s.code().or_else(|| s.signal().map(|sig| 128 + sig)));
+        if let Some((mut outcome, _)) = stopped {
+            outcome.exit = exit;
+            return outcome;
+        }
+        match exit {
+            Some(code) => exited(log, code, format!("exited {code}")),
+            None => Outcome::failed("it ended without an exit code"),
+        }
+    }
+}
+
+/// How a job that ran to its own end with `code` ended: failed, but for 0, with `why` and its last line.
+fn exited(log: &Log, code: i32, why: String) -> Outcome {
+    if code == 0 {
+        return Outcome {
+            state: End::Succeeded,
+            exit: Some(0),
+            reason: None,
+        };
+    }
+    Outcome {
+        state: End::Failed,
+        exit: Some(code),
+        reason: Some(match log.last_line() {
+            Some(line) => format!("{why}; its last line: {line}"),
+            None => why,
+        }),
+    }
+}
+
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Sends `signal` to every process in process group `group`; one already gone is no error.
+fn signal_group(group: i32, signal: i32) {
+    if group > 1 {
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+        unsafe {
+            kill(-group, signal);
+        }
+    }
+}
+
+/// Whether `repo` is on `allowed`, the config's `host_runs`: GitHub names are not case-sensitive.
+pub fn may_run_on_host(allowed: &[String], repo: &str) -> bool {
+    allowed.iter().any(|a| a.eq_ignore_ascii_case(repo))
 }
 
 /// How a job's container stood once `podman run` returned, as `podman inspect` says.
@@ -1274,7 +1423,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::budget::{Budget, Cpu, Resources};
-    use crate::service::{HostRun, Requirements};
+    use crate::service::{HostRun, Requirements, Secrets};
 
     /// A run of `job` requesting `memory` and `timeout`, admitted with half a CPU and `admitted` MiB.
     pub fn assignment(
@@ -1296,10 +1445,12 @@ pub(crate) mod tests {
                     timeout,
                 },
                 labels: BTreeMap::new(),
+                on_host: false,
             },
             cpu: Cpu::of(0.5),
             memory: admitted,
             lease: 60,
+            secrets: Default::default(),
         }
     }
 
@@ -1339,6 +1490,8 @@ run = ["python", "jobs/plain.py"]
                 timeout: 60,
                 stall: Some(DEFAULT_STALL),
                 credentials: vec![],
+                secrets: vec![],
+                on_host: false,
             }
         );
         let p = plan(TOML, &assignment("plain", None, None, 1024)).unwrap();
@@ -1482,7 +1635,227 @@ run = ["python", "jobs/plain.py"]
             &assignment("restart", None, None, 1024),
         )
         .unwrap_err();
-        assert!(e.contains("runs on host laptop itself"), "{e}");
+        assert!(
+            e.contains("submit the run onHost with requirements.host = \"laptop\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_run_on_the_host_and_its_secrets_are_in_its_plan_and_launch_line() {
+        let mut run = assignment("hello", None, None, 1024);
+        run.run.on_host = true;
+        run.secrets = Secrets(BTreeMap::from([
+            ("NPM_TOKEN".to_string(), "npm_value".to_string()),
+            ("AWS_ROLE_ARN".to_string(), "arn".to_string()),
+        ]));
+        let p = plan(TOML, &run).unwrap();
+        assert!(p.on_host);
+        assert_eq!(p.secrets, ["AWS_ROLE_ARN", "NPM_TOKEN"]);
+        let line = launch_line(&p);
+        assert_eq!(
+            line,
+            "running on this host itself, as its user, with a 60s timeout, given secrets AWS_ROLE_ARN, NPM_TOKEN: python jobs/hello.py x"
+        );
+        assert!(!line.contains("npm_value"));
+        assert!(
+            !format!("{run:?}").contains("npm_value"),
+            "Debug shows no secret"
+        );
+    }
+
+    #[test]
+    fn only_a_repo_on_host_runs_runs_on_the_host() {
+        let allowed = ["me/deploy-routines".to_string()];
+        assert!(may_run_on_host(&allowed, "me/deploy-routines"));
+        assert!(may_run_on_host(&allowed, "Me/Deploy-Routines"));
+        assert!(!may_run_on_host(&allowed, "me/other"));
+        assert!(!may_run_on_host(&[], "me/deploy-routines"));
+    }
+
+    /// A Podman whose repos are cloned from `git_base`, running runs `onHost` for `host_runs`.
+    fn host_podman(
+        service: Arc<Recorder>,
+        work_dir: PathBuf,
+        git_base: String,
+        host_runs: &[&str],
+    ) -> Podman<Recorder> {
+        Podman {
+            service,
+            work_dir,
+            git_credential_helper: None,
+            base_owner: String::new(),
+            grace: Duration::from_secs(1),
+            cgroup_parent: None,
+            platform: None,
+            memory_overhead: 0,
+            credentials: Arc::new(credentials::Host),
+            git_base,
+            building: Mutex::new(()),
+            stopping: || false,
+            host_runs: host_runs.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// A repo `o/deploy` under `root`, whose one commit's `jobs.toml` is `toml`; answers that commit.
+    fn host_repo(root: &Path, toml: &str) -> String {
+        let src = root.join("o").join("deploy.git");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("jobs.toml"), toml).unwrap();
+        let git = |args: &[&str]| {
+            let out = clean("git")
+                .current_dir(&src)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "jobs.toml"]);
+        git(&["commit", "-q", "-m", "jobs"]);
+        git(&["rev-parse", "HEAD"])
+    }
+
+    fn host_run(commit: String, secrets: &[(&str, &str)]) -> Assignment {
+        let mut run = assignment("deploy", None, None, 1024);
+        run.run.repo = "o/deploy".into();
+        run.run.commit = commit;
+        run.run.args = vec![];
+        run.run.on_host = true;
+        run.secrets = Secrets(
+            secrets
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        run
+    }
+
+    fn run_on_host(podman: &Podman<Recorder>, run: &Assignment) -> Outcome {
+        let budget = budget(2.0, 4096, 512);
+        let reservation = budget
+            .reserve_job(Resources {
+                cpu: Cpu::of(0.5),
+                memory: 1024,
+            })
+            .unwrap();
+        let log = Log::start(podman.service.clone(), run.run.id.clone());
+        let outcome = podman.run_job(&log, run, &reservation, &budget);
+        log.close(Duration::from_secs(5));
+        outcome
+    }
+
+    #[test]
+    fn a_host_run_runs_in_its_checkout_as_the_hosts_user_with_its_secrets_masked() {
+        let root = std::env::temp_dir().join(format!("jobber-host-onhost-{}", std::process::id()));
+        let commit = host_repo(
+            &root,
+            "[jobs.deploy]\nrun = [\"sh\", \"-c\", \"echo token=$DEPLOY_TOKEN; echo dir=$(pwd); echo uid=$(id -u); test -f jobs.toml\"]\n",
+        );
+        let service = Arc::new(Recorder::default());
+        let work = root.join("work");
+        let podman = host_podman(
+            service.clone(),
+            work.clone(),
+            format!("file://{}/", root.display()),
+            &["o/deploy"],
+        );
+        let outcome = run_on_host(
+            &podman,
+            &host_run(commit, &[("DEPLOY_TOKEN", "dt-not-a-real-secret")]),
+        );
+        let log = String::from_utf8_lossy(&service.0.lock().unwrap()).to_string();
+        remove(&root);
+        assert!(
+            matches!(outcome.state, End::Succeeded),
+            "{outcome:?}: {log}"
+        );
+        assert_eq!(outcome.exit, Some(0));
+        assert!(log.contains("token=***\n"), "{log}");
+        assert!(!log.contains("dt-not-a-real-secret"), "{log}");
+        assert!(
+            log.contains(&format!("dir={}\n", work.join("j").display())),
+            "{log}"
+        );
+        let uid = String::from_utf8_lossy(&clean("id").arg("-u").output().unwrap().stdout)
+            .trim()
+            .to_string();
+        assert!(log.contains(&format!("uid={uid}\n")), "{log}");
+        assert!(log.contains("running on this host itself"), "{log}");
+    }
+
+    #[test]
+    fn a_host_run_of_a_repo_not_on_host_runs_is_failed_before_its_checkout() {
+        let root = std::env::temp_dir().join(format!("jobber-host-refused-{}", std::process::id()));
+        let service = Arc::new(Recorder::default());
+        let podman = host_podman(
+            service.clone(),
+            root.join("work"),
+            "file:///nowhere/".into(),
+            &["o/other"],
+        );
+        let outcome = run_on_host(&podman, &host_run("0".repeat(40), &[]));
+        let log = String::from_utf8_lossy(&service.0.lock().unwrap()).to_string();
+        assert!(matches!(outcome.state, End::Failed));
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("refused: o/deploy may not run on this host itself, as it is not on this host's host_runs")
+        );
+        assert!(!log.contains("checking out"), "{log}");
+        assert!(!root.join("work").join("j").exists());
+    }
+
+    #[test]
+    fn a_host_run_past_its_timeout_is_stopped_with_everything_it_started() {
+        let dir = std::env::temp_dir().join(format!("jobber-host-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = Arc::new(Recorder::default());
+        let podman = host_podman(service.clone(), dir.clone(), String::new(), &[]);
+        let plan = Plan {
+            run: vec![
+                "sh".into(),
+                "-c".into(),
+                "sleep 60 & echo $! > child; trap '' TERM; sleep 60".into(),
+            ],
+            memory: 64,
+            cpu: Cpu::of(0.5),
+            timeout: 1,
+            stall: None,
+            credentials: vec![],
+            secrets: vec![],
+            on_host: true,
+        };
+        let log = Log::start(service.clone(), "j".into());
+        let began = Instant::now();
+        let outcome = podman.on_host(&log, &plan, &[], &dir);
+        log.close(Duration::from_secs(5));
+        let child: u32 = std::fs::read_to_string(dir.join("child"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        remove(&dir);
+        assert!(matches!(outcome.state, End::Failed));
+        assert_eq!(outcome.reason.as_deref(), Some("timed out after 1s"));
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "killed after its grace, not waited for"
+        );
+        // Gone, or a zombie no one has reaped: not running.
+        let state = std::fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
+        assert!(
+            state.is_empty() || state.contains(") Z "),
+            "{child} still runs: {state}"
+        );
     }
 
     #[test]
@@ -1678,6 +2051,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         let log = Log::start(Arc::new(Recorder::default()), "j".into());
         let url = format!("file://{}", src.display());
@@ -1756,6 +2130,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         let budget = budget(1.0, 2048, 512);
         let job = budget
@@ -1805,6 +2180,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -1824,6 +2200,8 @@ run = ["python", "jobs/plain.py"]
             timeout: 60,
             stall: None,
             credentials: vec![],
+            secrets: vec![],
+            on_host: false,
         };
         let name = format!("job-ws-{}", std::process::id());
         let outcome = podman.contain(
@@ -1862,6 +2240,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -1883,6 +2262,8 @@ run = ["python", "jobs/plain.py"]
                 timeout: 60,
                 stall: None,
                 credentials: vec![],
+                secrets: vec![],
+                on_host: false,
             };
             let name = format!("job-cred-{}-{}", std::process::id(), env.len());
             let outcome = podman.contain(
@@ -1899,7 +2280,7 @@ run = ["python", "jobs/plain.py"]
             text
         };
         let sent = run(&[Var {
-            name: "GH_TOKEN",
+            name: "GH_TOKEN".into(),
             value: "ghp_not-a-real-token-1234".into(),
             secret: true,
         }]);
@@ -1928,6 +2309,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         }
     }
 
@@ -1945,6 +2327,8 @@ run = ["python", "jobs/plain.py"]
             timeout: 600,
             stall: Some(stall),
             credentials: vec![],
+            secrets: vec![],
+            on_host: false,
         };
         let started = Instant::now();
         let outcome = podman.contain(
@@ -2036,6 +2420,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2075,6 +2460,8 @@ run = ["python", "jobs/plain.py"]
             timeout: 120,
             stall: None,
             credentials: vec![],
+            secrets: vec![],
+            on_host: false,
         };
         let started = Instant::now();
         let outcome = podman.contain(
@@ -2123,6 +2510,7 @@ run = ["python", "jobs/plain.py"]
             git_base: GITHUB.into(),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2150,6 +2538,8 @@ run = ["python", "jobs/plain.py"]
             timeout: 120,
             stall: None,
             credentials: vec![],
+            secrets: vec![],
+            on_host: false,
         };
         let outcome = podman.contain(
             &log,
@@ -2252,6 +2642,7 @@ run = ["python", "jobs/plain.py"]
             git_base: format!("file://{}/src/", root.display()),
             building: Mutex::new(()),
             stopping: || false,
+            host_runs: vec![],
         };
         let mut c = assignment("wait", None, Some(600), 256);
         c.run.id = id.clone();
