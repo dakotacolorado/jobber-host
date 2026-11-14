@@ -185,6 +185,7 @@ fn podman(config: &Config, hosts: Arc<Hosts>) -> Podman<Hosts> {
         git_base: executor::GITHUB.into(),
         building: std::sync::Mutex::new(()),
         stopping: sys::stopping,
+        host_runs: config.host_runs.clone(),
     }
 }
 
@@ -250,6 +251,7 @@ fn identity(config: &Config, offered: Resources) -> Option<Identity> {
                         capacity: offered,
                         labels: &config.labels,
                         version: VERSION,
+                        features: service::FEATURES,
                     },
                 )?;
                 Identity {

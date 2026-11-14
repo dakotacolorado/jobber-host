@@ -28,7 +28,7 @@ use crate::budget::{Cpu, JobReservation, Resources, Shared};
 use crate::heartbeat::{self, metrics};
 use crate::log;
 use crate::retry::{Backoff, Executor};
-use crate::service::{Assignment, Beat, Failure, Heartbeat, HostRun, Hosts, Metrics};
+use crate::service::{Assignment, Beat, Failure, Heartbeat, HostRun, Hosts, Metrics, Secrets};
 
 /// The most between tries to connect.
 const MOST: Duration = Duration::from_secs(30);
@@ -62,6 +62,9 @@ enum Incoming {
         attempt: u64,
         #[serde(default)]
         lease: Option<u64>,
+        /// The run's secrets, sent with its start alone; none from a jobber before them.
+        #[serde(default)]
+        secrets: Secrets,
     },
     Drop {
         run: String,
@@ -407,12 +410,13 @@ impl<E: Executor> Host<E> {
                 run,
                 attempt,
                 lease,
+                secrets,
             } => {
                 if self.hosts.attempt(&run) == Some(attempt) {
                     return None;
                 }
                 match state.accepted.remove(&(run.clone(), attempt)) {
-                    Some(accepted) => self.start(accepted, attempt, lease),
+                    Some(accepted) => self.start(accepted, attempt, lease, secrets),
                     None => {
                         log!("run {run}: start for attempt {attempt}, not accepted here: ignored")
                     }
@@ -514,7 +518,7 @@ impl<E: Executor> Host<E> {
         }
     }
 
-    fn start(&self, accepted: Accepted, attempt: u64, lease: Option<u64>) {
+    fn start(&self, accepted: Accepted, attempt: u64, lease: Option<u64>, secrets: Secrets) {
         let Accepted {
             run,
             admitted,
@@ -528,6 +532,7 @@ impl<E: Executor> Host<E> {
             cpu: admitted.cpu,
             memory: admitted.memory,
             lease: lease.unwrap_or(assigned),
+            secrets,
         };
         log!("run {id}: attempt {attempt} started");
         self.hosts.begin(&id, attempt);
@@ -861,6 +866,21 @@ mod tests {
             "memory": memory,
             "lease": 60
         })
+    }
+
+    #[test]
+    fn a_start_carries_its_runs_secrets_and_never_shows_them() {
+        let with: Incoming = serde_json::from_value(json!({"type": "start", "run": "r1", "attempt": 1, "lease": 45, "secrets": {"NPM_TOKEN": "npm_value"}})).unwrap();
+        let Incoming::Start { secrets, .. } = &with else {
+            panic!("{with:?}")
+        };
+        assert_eq!(secrets.0["NPM_TOKEN"], "npm_value");
+        assert!(!format!("{with:?}").contains("npm_value"), "{with:?}");
+        let before: Incoming = serde_json::from_value(start_message("r1", 1)).unwrap();
+        let Incoming::Start { secrets, .. } = before else {
+            panic!()
+        };
+        assert!(secrets.0.is_empty(), "none from a jobber before secrets");
     }
 
     fn start_message(run: &str, attempt: u64) -> Value {

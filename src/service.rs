@@ -111,7 +111,14 @@ pub struct RegisterHost<'a> {
     pub capacity: Resources,
     pub labels: &'a BTreeMap<String, String>,
     pub version: &'a str,
+    /// What it can do beyond running a run in its repo's container: jobber
+    /// sends a run needing one only to a host that names it.
+    pub features: &'a [&'a str],
 }
+
+/// What every jobber-host of this version can do, as it registers: give a run
+/// the secrets jobber sends with its start, and run a run on the host itself.
+pub const FEATURES: &[&str] = &["secrets", "hostRuns"];
 
 #[derive(Debug, Deserialize)]
 pub struct RegisteredHost {
@@ -181,6 +188,23 @@ pub struct HostRun {
     pub args: Vec<String>,
     pub requirements: Requirements,
     pub labels: BTreeMap<String, String>,
+    /// Runs on this machine itself, as its user, outside a container: only
+    /// for a repo on the config's `host_runs`.
+    #[serde(default, rename = "onHost")]
+    pub on_host: bool,
+}
+
+/// A run's secrets as jobber sends them with its `start`, by name: kept only
+/// in memory and given to the run as environment variables. Never printed:
+/// its `Debug` shows names alone.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Secrets(pub BTreeMap<String, String>);
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 /// A run accepted and started here: what the executor runs.
@@ -193,6 +217,7 @@ pub struct Assignment {
     pub memory: u64,
     /// Seconds it lives without a heartbeat listing it.
     pub lease: u64,
+    pub secrets: Secrets,
 }
 
 /// A host's own calls, under its own token `<id>.<secret>`, and what it has
@@ -529,6 +554,7 @@ mod tests {
                 },
                 labels: &labels,
                 version: "0.1.0",
+                features: FEATURES,
             },
         )
         .unwrap();
@@ -541,7 +567,7 @@ mod tests {
         assert!(sent[0].head.contains("Authorization: Bearer reg"));
         assert_eq!(
             sent[0].json(),
-            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216},"labels":{"gpu":"none"},"version":"0.1.0"})
+            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216},"labels":{"gpu":"none"},"version":"0.1.0","features":["secrets","hostRuns"]})
         );
     }
 
