@@ -102,13 +102,23 @@ pub struct RegisteredId {
     pub id: String,
 }
 
+/// What a host offers runs, and the size of its GPUs, each taken whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Capacity {
+    #[serde(flatten)]
+    pub resources: Resources,
+    /// MiB of memory of its smallest GPU; 0 with none.
+    #[serde(rename = "gpuMemory")]
+    pub gpu_memory: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RegisterHost<'a> {
     pub name: &'a str,
     pub os: &'a str,
     pub arch: &'a str,
     /// What it offers: measured, less what it keeps back.
-    pub capacity: Resources,
+    pub capacity: Capacity,
     pub labels: &'a BTreeMap<String, String>,
     pub version: &'a str,
     /// What it can do beyond running a run in its repo's container: jobber
@@ -178,6 +188,9 @@ pub struct Requirements {
     /// Whole GPUs; absent from a jobber before GPUs.
     #[serde(default)]
     pub gpu: Option<u32>,
+    /// MiB of memory each of its GPUs must have.
+    #[serde(default, rename = "gpuMemory")]
+    pub gpu_memory: Option<u64>,
     pub timeout: Option<u64>,
 }
 
@@ -553,10 +566,13 @@ mod tests {
                 name: "box",
                 os: "linux",
                 arch: "x86_64",
-                capacity: Resources {
-                    cpu: Cpu::of(13.5),
-                    memory: 9216,
-                    gpu: 0,
+                capacity: Capacity {
+                    resources: Resources {
+                        cpu: Cpu::of(13.5),
+                        memory: 9216,
+                        gpu: 1,
+                    },
+                    gpu_memory: 6144,
                 },
                 labels: &labels,
                 version: "0.1.0",
@@ -573,7 +589,7 @@ mod tests {
         assert!(sent[0].head.contains("Authorization: Bearer reg"));
         assert_eq!(
             sent[0].json(),
-            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216,"gpu":0},"labels":{"gpu":"none"},"version":"0.1.0","features":["secrets","hostRuns"]})
+            json!({"name":"box","os":"linux","arch":"x86_64","capacity":{"cpu":13.5,"memory":9216,"gpu":1,"gpuMemory":6144},"labels":{"gpu":"none"},"version":"0.1.0","features":["secrets","hostRuns"]})
         );
     }
 
@@ -591,6 +607,7 @@ mod tests {
                 cpu: Some(0.25),
                 memory: Some(512),
                 gpu: None,
+                gpu_memory: None,
                 timeout: None
             }
         );

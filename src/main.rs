@@ -124,6 +124,16 @@ fn main() -> ExitCode {
         print!("{}", config.slice.unit(offered));
         return ExitCode::SUCCESS;
     }
+    let gpu_memory = match config
+        .gpu_memory
+        .map_or_else(|| capacity::gpu_memory(&config.gpus), Ok)
+    {
+        Ok(mib) => mib,
+        Err(e) => {
+            log!("jobber-host: {e}");
+            return ExitCode::from(2);
+        }
+    };
     log!(
         "measured {} CPU and {} MiB; keeping back {} CPU and {} MiB, it offers {} CPU and {} MiB",
         measured.cpu,
@@ -153,7 +163,7 @@ fn main() -> ExitCode {
         if config.gpus.is_empty() {
             "no GPUs".to_string()
         } else {
-            format!("GPUs {}", config.gpus.join(" "))
+            format!("GPUs {} of {gpu_memory} MiB", config.gpus.join(" "))
         },
         config.labels,
         config.cgroup_parent.as_deref().unwrap_or("podman's default cgroup")
@@ -165,14 +175,18 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     executor::sweep(&config.work_dir);
-    let Some(identity) = identity(&config, offered) else {
+    let capacity = service::Capacity {
+        resources: offered,
+        gpu_memory,
+    };
+    let Some(identity) = identity(&config, capacity) else {
         log!("stopped before registering");
         return ExitCode::SUCCESS;
     };
     let hosts = Arc::new(Hosts::new(&config.service, &identity.id, &identity.token));
     connection::Host {
         hosts: hosts.clone(),
-        executor: Arc::new(podman(&config, hosts)),
+        executor: Arc::new(podman(&config, hosts, gpu_memory)),
         budget: budget(&config, offered),
         work_dir: config.work_dir.clone(),
         every: heartbeat::EVERY,
@@ -182,7 +196,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn podman(config: &Config, hosts: Arc<Hosts>) -> Podman<Hosts> {
+fn podman(config: &Config, hosts: Arc<Hosts>, gpu_memory: u64) -> Podman<Hosts> {
     Podman {
         service: hosts,
         work_dir: config.work_dir.clone(),
@@ -197,6 +211,7 @@ fn podman(config: &Config, hosts: Arc<Hosts>) -> Podman<Hosts> {
         building: std::sync::Mutex::new(()),
         stopping: sys::stopping,
         host_runs: config.host_runs.clone(),
+        gpu_memory,
     }
 }
 
@@ -236,7 +251,7 @@ fn hold(config: &Config) -> Result<std::fs::File, String> {
 /// jobber has its current capacity and version; its name keeps its id. A
 /// state file that cannot be read is retried too: it is the person's to fix,
 /// and the host stays up saying why. None only when told to stop first.
-fn identity(config: &Config, offered: Resources) -> Option<Identity> {
+fn identity(config: &Config, offered: service::Capacity) -> Option<Identity> {
     // Registered but not yet saved: saved again rather than registered again.
     let mut unsaved: Option<Identity> = None;
     retrying("registering", &sys::stopping, || {

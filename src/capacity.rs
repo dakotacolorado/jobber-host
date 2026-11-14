@@ -47,6 +47,56 @@ pub fn allocatable(
     Ok(offered)
 }
 
+/// MiB of memory of the smallest of `devices`, CDI names such as
+/// `nvidia.com/gpu=0`, as `nvidia-smi` measures it; 0 with none.
+pub fn gpu_memory(devices: &[String]) -> Result<u64, String> {
+    if devices.is_empty() {
+        return Ok(0);
+    }
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,uuid,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .map_err(|e| {
+            format!("measuring its GPUs' memory, nvidia-smi: {e}: set gpu_memory in the config")
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "measuring its GPUs' memory, nvidia-smi failed: {}: set gpu_memory in the config",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    smallest_gpu(devices, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// The least memory of `devices` in `nvidia-smi`'s `index, uuid, MiB` lines:
+/// a CDI name ends with a GPU's index or UUID, or `all`.
+fn smallest_gpu(devices: &[String], listed: &str) -> Result<u64, String> {
+    let gpus: Vec<(&str, &str, u64)> = listed
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(',').map(str::trim);
+            Some((f.next()?, f.next()?, f.next()?.parse().ok()?))
+        })
+        .collect();
+    devices
+        .iter()
+        .map(|device| {
+            let name = device.rsplit_once('=').map_or("", |(_, n)| n);
+            let sizes: Vec<u64> = gpus
+                .iter()
+                .filter(|(index, uuid, _)| name == "all" || name == *index || name == *uuid)
+                .map(|g| g.2)
+                .collect();
+            sizes.into_iter().min().ok_or_else(|| {
+                format!("nvidia-smi lists no GPU {name} for {device}: set gpu_memory in the config")
+            })
+        })
+        .try_fold(u64::MAX, |least, size| size.map(|s| least.min(s)))
+}
+
 #[cfg(target_os = "linux")]
 pub fn memory() -> Option<u64> {
     let total = crate::heartbeat::parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)?.1;
@@ -104,6 +154,25 @@ fn cgroup_limit(path: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gpus_memory_is_nvidia_smis_for_its_index_or_uuid_and_the_least_of_several() {
+        let listed = "0, GPU-aaa, 24564\n1, GPU-bbb, 6144\n";
+        let of = |names: &[&str]| {
+            smallest_gpu(
+                &names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                listed,
+            )
+        };
+        assert_eq!(of(&["nvidia.com/gpu=0"]), Ok(24564));
+        assert_eq!(of(&["nvidia.com/gpu=GPU-bbb"]), Ok(6144));
+        assert_eq!(of(&["nvidia.com/gpu=0", "nvidia.com/gpu=1"]), Ok(6144));
+        assert_eq!(of(&["nvidia.com/gpu=all"]), Ok(6144));
+        assert!(of(&["nvidia.com/gpu=2"])
+            .unwrap_err()
+            .contains("set gpu_memory"));
+        assert_eq!(gpu_memory(&[]), Ok(0));
+    }
 
     fn r(cpu: f64, memory: u64) -> Resources {
         Resources {

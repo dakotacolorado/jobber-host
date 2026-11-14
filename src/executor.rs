@@ -52,6 +52,8 @@ pub struct Podman<S: Service> {
     pub stopping: fn() -> bool,
     /// Repos whose runs `onHost` it runs on this host itself: the config's `host_runs`.
     pub host_runs: Vec<String>,
+    /// MiB of memory of its smallest GPU, which jobber was told.
+    pub gpu_memory: u64,
 }
 
 // --- jobs.toml ---------------------------------------------------------------
@@ -61,6 +63,7 @@ pub struct Podman<S: Service> {
 struct Defaults {
     memory: Option<u64>,
     gpu: Option<u32>,
+    gpu_memory: Option<u64>,
     timeout: Option<u64>,
     stall: Option<u64>,
 }
@@ -72,6 +75,8 @@ struct JobDef {
     memory: Option<u64>,
     /// Whole GPUs its container is given, each its own.
     gpu: Option<u32>,
+    /// MiB of memory each of its GPUs must have.
+    gpu_memory: Option<u64>,
     timeout: Option<u64>,
     /// Seconds without progress before it is ended as stalled; 0 for never.
     stall: Option<u64>,
@@ -115,7 +120,7 @@ pub struct Plan {
     pub on_host: bool,
 }
 
-pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
+pub fn plan(text: &str, run: &Assignment, gpu_memory: u64) -> Result<Plan, String> {
     let file: JobsToml = toml::from_str(text).map_err(|e| format!("jobs.toml: {e}"))?;
     let name = &run.run.job;
     let def = file
@@ -146,11 +151,25 @@ pub fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
         .gpu
         .or(def.gpu)
         .or(file.defaults.gpu)
-        .unwrap_or(0);
+        .unwrap_or(run.gpus.len() as u32);
     if gpu as usize > run.gpus.len() {
         return Err(format!(
             "jobs.toml gives it {gpu} GPU, over the {} it was admitted with: submit it with requirements.gpu = {gpu}",
             run.gpus.len()
+        ));
+    }
+    if let Some(wants) = (gpu > 0)
+        .then(|| {
+            requirements
+                .gpu_memory
+                .or(def.gpu_memory)
+                .or(file.defaults.gpu_memory)
+        })
+        .flatten()
+        .filter(|&wants| wants > gpu_memory)
+    {
+        return Err(format!(
+            "jobs.toml asks for GPUs of {wants} MiB, over this host's {gpu_memory} MiB: submit it with requirements.gpuMemory = {wants}"
         ));
     }
     let timeout = requirements
@@ -978,7 +997,7 @@ impl<S: Service> Podman<S> {
         }
         let plan = match std::fs::read_to_string(dir.join("jobs.toml")) {
             Err(e) => Err(format!("no jobs.toml: {e}")),
-            Ok(text) => plan(&text, run),
+            Ok(text) => plan(&text, run, self.gpu_memory),
         };
         let plan = match plan {
             Ok(plan) => plan,
@@ -1445,6 +1464,11 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    /// A plan on a host whose GPUs have 24564 MiB.
+    fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
+        super::plan(text, run, 24564)
+    }
     use crate::budget::{Budget, Cpu, Resources};
     use crate::service::{HostRun, Requirements, Secrets};
 
@@ -1466,6 +1490,7 @@ pub(crate) mod tests {
                     cpu: None,
                     memory,
                     gpu: None,
+                    gpu_memory: None,
                     timeout,
                 },
                 labels: BTreeMap::new(),
@@ -1688,6 +1713,30 @@ run = ["python", "jobs/plain.py"]
     }
 
     #[test]
+    fn a_job_asking_for_larger_gpus_than_its_hosts_is_refused_and_one_admitted_by_size_gets_one() {
+        let toml = "[jobs.big]\nrun = [\"train\"]\ngpu = 1\ngpu_memory = 16384\n\
+                    [jobs.any]\nrun = [\"train\"]\n";
+        let mut a = assignment("big", None, None, 1024);
+        a.gpus = vec!["nvidia.com/gpu=0".into()];
+        assert_eq!(super::plan(toml, &a, 24564).unwrap().gpus.len(), 1);
+        let err = super::plan(toml, &a, 6144).unwrap_err();
+        assert!(
+            err.contains(
+                "over this host's 6144 MiB: submit it with requirements.gpuMemory = 16384"
+            ),
+            "{err}"
+        );
+        // jobber admits a run naming only gpuMemory with one GPU, which jobs.toml need not name.
+        let mut a = assignment("any", None, None, 1024);
+        a.gpus = vec!["nvidia.com/gpu=0".into()];
+        a.run.requirements.gpu_memory = Some(4096);
+        assert_eq!(
+            super::plan(toml, &a, 6144).unwrap().gpus,
+            ["nvidia.com/gpu=0"]
+        );
+    }
+
+    #[test]
     fn a_job_a_job_runner_runs_on_its_host_itself_is_refused_not_run_in_a_container() {
         let e = plan(
             "[jobs.restart]\nrun = [\"x\"]\nhost = \"laptop\"\n",
@@ -1753,6 +1802,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: host_runs.iter().map(|r| r.to_string()).collect(),
+            gpu_memory: 0,
         }
     }
 
@@ -2113,6 +2163,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         let log = Log::start(Arc::new(Recorder::default()), "j".into());
         let url = format!("file://{}", src.display());
@@ -2192,6 +2243,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         let budget = budget(1.0, 2048, 512);
         let job = budget
@@ -2243,6 +2295,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2304,6 +2357,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2374,6 +2428,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         }
     }
 
@@ -2528,6 +2583,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2619,6 +2675,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2752,6 +2809,7 @@ run = ["python", "jobs/plain.py"]
             building: Mutex::new(()),
             stopping: || false,
             host_runs: vec![],
+            gpu_memory: 0,
         };
         let mut c = assignment("wait", None, Some(600), 256);
         c.run.id = id.clone();

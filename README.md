@@ -63,6 +63,7 @@ Every setting is in `config.toml`, at `$XDG_CONFIG_HOME/jobber-host/` or
 | `git_credential_helper` | your git config's | Credential helper for private repos, e.g. `!gh auth git-credential`. |
 | `host_runs` | none | Repos (`owner/name`) whose `onHost` runs may run on this machine outside a container. |
 | `gpus` | none | GPUs it offers, as podman CDI device names, e.g. `["nvidia.com/gpu=0"]`. Each is given whole to one run at a time. |
+| `gpu_memory` | `nvidia-smi`'s | MiB of memory of its smallest GPU, registered so runs needing larger ones go elsewhere. |
 | `base_owner` | `dakotacolorado` | GitHub owner whose `base-<name>` repos base images are built from. |
 | `state_file` | `~/.local/state/jobber-host/host.json` | Its id and token, mode 600. |
 | `work_dir` | `~/.local/share/jobber-host` | Where run checkouts are made. |
@@ -92,12 +93,16 @@ stall = 120       # seconds without output, CPU or network before it is ended; 0
 [jobs.train]
 run = ["python", "train.py"]
 gpu = 1           # whole GPUs, each its container's own (`--device`)
+gpu_memory = 16384  # MiB each must have; a smaller host's GPUs fail it
 ```
 
 A run's **GPUs** are what it was submitted with, `requirements.gpu`: jobber
 never reads `jobs.toml`, so it schedules a run only by that, on a host with
 that many free. A job whose `jobs.toml` asks for more GPUs than its run holds
-fails, saying to submit it with `requirements.gpu`. See
+fails, saying to submit it with `requirements.gpu`; one whose `gpu_memory`
+is more than this host's GPUs have fails, saying to submit it with
+`requirements.gpuMemory`, which jobber places only on a host whose GPUs are
+that large, and on the smallest such. See
 [docs/add-a-host.md](docs/add-a-host.md#gpus) to offer a machine's GPUs.
 
 A run's **secrets** reach it as environment variables of their names. They are

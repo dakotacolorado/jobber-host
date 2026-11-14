@@ -52,6 +52,8 @@ pub struct Config {
     /// The GPUs it offers runs, as podman CDI device names (`nvidia.com/gpu=0`),
     /// each given whole to one run's container at a time.
     pub gpus: Vec<String>,
+    /// MiB of memory of its smallest GPU; none: as `nvidia-smi` measures it.
+    pub gpu_memory: Option<u64>,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -129,6 +131,7 @@ struct File {
     host_runs: Vec<String>,
     #[serde(default)]
     gpus: Vec<String>,
+    gpu_memory: Option<u64>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
@@ -282,6 +285,7 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
             })
             .collect::<Result<_, _>>()?,
         gpus: gpus(file.gpus)?,
+        gpu_memory: file.gpu_memory,
     })
 }
 
@@ -360,6 +364,7 @@ mod tests {
                 slice: Slice::default(),
                 host_runs: vec![],
                 gpus: vec![],
+                gpu_memory: None,
             }
         );
     }

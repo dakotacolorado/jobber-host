@@ -83,8 +83,10 @@ run has them meanwhile. For NVIDIA:
 3. **Name them** in `~/.config/jobber-host/config.toml`, by index rather than
    `all`, so runs can hold them one at a time:
    `gpus = ["nvidia.com/gpu=0"]`, then run `scripts/install.sh` again. Its log
-   says `GPUs nvidia.com/gpu=0`, and jobber lists the host's capacity with
-   `1 GPU`.
+   says `GPUs nvidia.com/gpu=0 of 24564 MiB`, and jobber lists the host's
+   capacity with `1 GPU of 24.0 GiB`. Their memory is `nvidia-smi`'s for each
+   device's index or UUID, the least of them registered; set `gpu_memory`
+   where it cannot measure them.
 
 A mac's podman machine has no GPU to give.
 
