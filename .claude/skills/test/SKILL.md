@@ -33,10 +33,12 @@ passes too.
 
 ## The podman tests (by hand)
 
-Eleven more, ignored by `cargo test`, need rootless podman, the network
+Twelve more, ignored by `cargo test`, need rootless podman, the network
 (busybox from docker.io) and a systemd user session: an image that will not
 build fails its run with the build's output in the log, a run writes in its
-workspace and it is deleted after, a run is sent only the credentials given
+workspace and it is deleted after, a run sees
+the host folders it mounts, writes there as the host's user, and the next run
+reads what it wrote, a run is sent only the credentials given
 it and reads them masked, a run with no output, CPU or network is ended as
 stalled at its `stall` limit and a silent busy one or a quiet chatty one past
 it is not (about 90s), a failed run's reason carries its last line, a run
@@ -55,7 +57,7 @@ JOBBER_HOST_TEST_SLICE=jobbertest.slice env -u DS_URL -u DS_TOKEN -u WT_URL -u W
 rm ~/.config/systemd/user/jobbertest.slice && systemctl --user daemon-reload
 ```
 
-A pass: `11 passed`, exit 0. On a Mac, podman runs every container in its
+A pass: `12 passed`, exit 0. On a Mac, podman runs every container in its
 podman machine, so make and remove the slice there
 (`podman machine ssh "..."` around the same two lines) and run the tests from
 the Mac.
