@@ -42,6 +42,13 @@ cargo run --release -- --config /path/to/config.toml
 
 Ctrl+C or SIGTERM stops the runs it has, reports them, and exits.
 
+SIGUSR2 drains it instead: it declines every run it is sent from then on, lets
+those it has (onHost ones too) run to their ends, reporting them as usual, and
+exits 0 once none is left. A service manager that restarts it, as the installed
+systemd unit and LaunchAgent do, then puts a new release in its place without
+stopping a run: `systemctl --user kill -s USR2 --kill-whom=main jobber-host`.
+SIGTERM while draining still stops what it runs at once.
+
 ## Configure it
 
 Every setting is in `config.toml`, at `$XDG_CONFIG_HOME/jobber-host/` or

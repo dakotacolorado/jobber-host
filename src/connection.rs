@@ -1184,6 +1184,42 @@ mod tests {
     }
 
     #[test]
+    fn once_draining_it_declines_what_is_assigned_and_runs_what_it_took_to_its_end() {
+        let fake = fake();
+        let host = start(&fake, 2, 2048);
+        host.hold(true);
+        let mut peer = fake.peer();
+        peer.send(assign("r1", 1, 256));
+        assert_eq!(peer.answer()["type"], "accept");
+        peer.send(start_message("r1", 1));
+        wait_for("it runs", || host.ran().len() == 1);
+        peer.send(assign("r2", 1, 256));
+        assert_eq!(peer.answer()["type"], "accept");
+        // Draining is winding down as stopping is: the executor alone tells them apart.
+        host.stop.store(true, Ordering::SeqCst);
+        peer.send(assign("r3", 1, 256));
+        let declined = peer.answer();
+        assert_eq!(declined["run"], "r3");
+        assert!(
+            declined["reason"].as_str().unwrap().contains("stopping"),
+            "{declined}"
+        );
+        peer.heartbeat_where(|b| b["running"] == json!([{"id": "r1", "attempt": 1}]));
+        peer.send(start_message("r2", 1));
+        wait_for("what it accepted runs too", || host.ran().len() == 2);
+        thread::sleep(Duration::from_millis(300));
+        assert!(!host.thread.is_finished(), "waiting for r1 and r2");
+        assert!(!host.ran().iter().any(|(id, ..)| id == "r3"));
+        host.hold(false);
+        host.thread.join().unwrap();
+        for run in ["r1", "r2"] {
+            assert!(fake
+                .requests()
+                .contains(&format!("PUT /runs/{run}?attempt=1")));
+        }
+    }
+
+    #[test]
     fn a_refused_connection_says_its_status() {
         let fake = fake();
         fake.refuse.store(true, Ordering::SeqCst);
