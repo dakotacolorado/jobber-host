@@ -191,8 +191,15 @@ fn main() -> ExitCode {
         work_dir: config.work_dir.clone(),
         every: heartbeat::EVERY,
     }
-    .run(&sys::stopping);
-    log!("stopped");
+    .run(&sys::winding_down);
+    log!(
+        "{}",
+        if sys::stopping() {
+            "stopped"
+        } else {
+            "drained: every run it took has ended"
+        }
+    );
     ExitCode::SUCCESS
 }
 
@@ -250,11 +257,11 @@ fn hold(config: &Config) -> Result<std::fs::File, String> {
 /// the identity in the state file. A host registers on every start, so
 /// jobber has its current capacity and version; its name keeps its id. A
 /// state file that cannot be read is retried too: it is the person's to fix,
-/// and the host stays up saying why. None only when told to stop first.
+/// and the host stays up saying why. None only when told to stop or drain first.
 fn identity(config: &Config, offered: service::Capacity) -> Option<Identity> {
     // Registered but not yet saved: saved again rather than registered again.
     let mut unsaved: Option<Identity> = None;
-    retrying("registering", &sys::stopping, || {
+    retrying("registering", &sys::winding_down, || {
         let transient = service::Failure::Transient;
         let identity = match unsaved.take() {
             Some(identity) => identity,

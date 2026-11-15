@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const SIGHUP: c_int = 1;
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+#[cfg(target_os = "linux")]
+const SIGUSR2: c_int = 12;
+#[cfg(not(target_os = "linux"))]
+const SIGUSR2: c_int = 31;
 const SIG_IGN: usize = 1;
 
 extern "C" {
@@ -16,25 +20,52 @@ extern "C" {
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
+static DRAINING: AtomicBool = AtomicBool::new(false);
+static SAID_DRAINING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop(_: c_int) {
     STOPPING.store(true, Ordering::SeqCst);
 }
 
+extern "C" fn on_drain(_: c_int) {
+    DRAINING.store(true, Ordering::SeqCst);
+}
+
 /// SIGTERM (systemd stopping the unit) and SIGINT only set a flag: the
 /// connection declines what it is sent and each running run is stopped and
-/// reported before the process exits. SIGHUP is ignored so a host started from a terminal
-/// outlives it.
+/// reported before the process exits. SIGUSR2 sets another: the connection
+/// declines what it is sent as when stopping, but running runs are left to
+/// end, and the process exits once none is left, so a service manager that
+/// restarts it puts a new release in its place. It is caught from here on, so
+/// a deploy can tell (by `SigCgt`) that this release drains. SIGHUP is
+/// ignored so a host started from a terminal outlives it.
 pub fn handle_signals() {
     unsafe {
         signal(SIGTERM, on_stop as extern "C" fn(c_int) as usize);
         signal(SIGINT, on_stop as extern "C" fn(c_int) as usize);
+        signal(SIGUSR2, on_drain as extern "C" fn(c_int) as usize);
         signal(SIGHUP, SIG_IGN);
     }
 }
 
+/// Told to stop now: running runs are stopped too.
 pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
+}
+
+/// Told to drain: no new run is taken, and those running end on their own.
+/// Said in the log the first time it is seen, since a handler cannot log.
+pub fn draining() -> bool {
+    let draining = DRAINING.load(Ordering::SeqCst);
+    if draining && !SAID_DRAINING.swap(true, Ordering::SeqCst) {
+        crate::log!("draining: declining new runs, and exiting once those running have ended");
+    }
+    draining
+}
+
+/// Taking no new run, for either reason.
+pub fn winding_down() -> bool {
+    stopping() || draining()
 }
 
 pub fn hostname() -> Option<String> {
@@ -108,4 +139,35 @@ macro_rules! log {
         use std::io::Write;
         let _ = writeln!(std::io::stderr(), $($arg)*);
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn raise(sig: c_int) -> c_int;
+    }
+
+    // The only test that signals the process: the flags are its own.
+    #[test]
+    fn sigusr2_is_caught_and_drains_without_stopping_and_twice_is_harmless() {
+        handle_signals();
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let caught = status
+                .lines()
+                .find_map(|l| l.strip_prefix("SigCgt:"))
+                .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+                .unwrap();
+            assert_ne!(caught & 1 << (SIGUSR2 - 1), 0, "SigCgt {caught:x}");
+        }
+        assert!(!draining() && !winding_down());
+        for _ in 0..2 {
+            assert_eq!(unsafe { raise(SIGUSR2) }, 0);
+            assert!(draining() && winding_down());
+            assert!(!stopping(), "draining leaves running runs be");
+        }
+    }
 }
