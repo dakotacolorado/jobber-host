@@ -71,6 +71,7 @@ Every setting is in `config.toml`, at `$XDG_CONFIG_HOME/jobber-host/` or
 | `host_runs` | none | Repos (`owner/name`) whose `onHost` runs may run on this machine outside a container. |
 | `gpus` | none | GPUs it offers, as podman CDI device names, e.g. `["nvidia.com/gpu=0"]`. Each is given whole to one run at a time. |
 | `gpu_memory` | `nvidia-smi`'s | MiB of memory of its smallest GPU, registered so runs needing larger ones go elsewhere. |
+| `mount_repos` | none | Repos whose jobs may mount this machine's folders, each with the folders those must be under, e.g. `{ "me/studio" = ["/data/studio"] }`. |
 | `base_owner` | `dakotacolorado` | GitHub owner whose `base-<name>` repos base images are built from. |
 | `state_file` | `~/.local/state/jobber-host/host.json` | Its id and token, mode 600. |
 | `work_dir` | `~/.local/share/jobber-host` | Where run checkouts are made. |
@@ -101,6 +102,11 @@ stall = 120       # seconds without output, CPU or network before it is ended; 0
 run = ["python", "train.py"]
 gpu = 1           # whole GPUs, each its container's own (`--device`)
 gpu_memory = 16384  # MiB each must have; a smaller host's GPUs fail it
+
+[jobs.render]
+run = ["python", "render.py"]
+host = "gpu-desktop"  # the jobber host it runs on; any other fails it
+mounts = { "/data/studio/models" = "/models", "/data/studio/out" = "/out" }
 ```
 
 A run's **GPUs** are what it was submitted with, `requirements.gpu`: jobber
@@ -111,6 +117,18 @@ is more than this host's GPUs have fails, saying to submit it with
 `requirements.gpuMemory`, which jobber places only on a host whose GPUs are
 that large, and on the smallest such. See
 [docs/add-a-host.md](docs/add-a-host.md#gpus) to offer a machine's GPUs.
+
+A job's **host** pins it to the jobber host of that name: on any other it
+fails, saying to submit it with `requirements.host`, which is what jobber
+places it by.
+
+A job's **mounts** give its container this machine's folders, read and
+written, at the container paths named; what a run writes there is the next
+run's to read, owned by jobber-host's user. They are made only for a repo in
+`mount_repos`, and only for folders under the ones it lists there, symlinks
+followed; a folder not there yet is made. A job that names any other fails
+before it runs, saying which. Two runs may write the same folder at once:
+give each its own.
 
 A run's **secrets** reach it as environment variables of their names. They are
 masked in its log and never written to disk.

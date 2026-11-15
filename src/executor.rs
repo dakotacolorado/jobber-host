@@ -54,6 +54,11 @@ pub struct Podman<S: Service> {
     pub host_runs: Vec<String>,
     /// MiB of memory of its smallest GPU, which jobber was told.
     pub gpu_memory: u64,
+    /// The host's name in jobber, which a job's `host` in `jobs.toml` must be.
+    pub name: String,
+    /// Repos whose jobs may mount this host's folders, each with the folders
+    /// what they mount must be under: the config's `mount_repos`.
+    pub mount_repos: BTreeMap<String, Vec<PathBuf>>,
 }
 
 // --- jobs.toml ---------------------------------------------------------------
@@ -86,9 +91,12 @@ struct JobDef {
     #[serde(default)]
     #[allow(dead_code)]
     labels: BTreeMap<String, String>,
-    /// The machine a job-runner runs it on, on the host itself: jobber has no such
-    /// runs, so a job that names one is refused rather than run in a container.
+    /// The jobber host it runs on, by name: any other refuses it.
     host: Option<String>,
+    /// Host folders its container is given, each at a container path:
+    /// `{ "<host path>" = "<container path>" }`.
+    #[serde(default)]
+    mounts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,9 +126,29 @@ pub struct Plan {
     pub secrets: Vec<String>,
     /// Runs on this host itself, not in a container.
     pub on_host: bool,
+    /// The host folders its container is given.
+    pub mounts: Vec<Mount>,
 }
 
-pub fn plan(text: &str, run: &Assignment, gpu_memory: u64) -> Result<Plan, String> {
+/// A host folder a job's container is given at `container`, read and written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount {
+    pub host: PathBuf,
+    pub container: String,
+    /// The folder of the config's `mount_repos` it is under.
+    pub within: PathBuf,
+}
+
+/// The host a job is planned on, as it was told: what `jobs.toml` is checked against.
+pub struct Here<'a> {
+    pub name: &'a str,
+    /// MiB of memory of its smallest GPU.
+    pub gpu_memory: u64,
+    pub mount_repos: &'a BTreeMap<String, Vec<PathBuf>>,
+}
+
+pub fn plan(text: &str, run: &Assignment, here: &Here) -> Result<Plan, String> {
+    let gpu_memory = here.gpu_memory;
     let file: JobsToml = toml::from_str(text).map_err(|e| format!("jobs.toml: {e}"))?;
     let name = &run.run.job;
     let def = file
@@ -130,9 +158,16 @@ pub fn plan(text: &str, run: &Assignment, gpu_memory: u64) -> Result<Plan, Strin
     if def.run.is_empty() {
         return Err(format!("[jobs.{name}] run is empty"));
     }
-    if let Some(host) = &def.host {
+    if let Some(host) = def.host.as_ref().filter(|h| *h != here.name) {
         return Err(format!(
-            "[jobs.{name}] names host {host}, which jobber-host does not read: submit the run onHost with requirements.host = {host:?}"
+            "refused: [jobs.{name}] runs on host {host}, not this host {}: submit it with requirements.host = {host:?}",
+            here.name
+        ));
+    }
+    let mounts = mounts(name, &def.mounts, &run.run.repo, here.mount_repos)?;
+    if run.run.on_host && !mounts.is_empty() {
+        return Err(format!(
+            "refused: [jobs.{name}] names mounts, which only a run in a container is given: submit it without onHost"
         ));
     }
     let requirements = &run.run.requirements;
@@ -194,7 +229,124 @@ pub fn plan(text: &str, run: &Assignment, gpu_memory: u64) -> Result<Plan, Strin
         credentials,
         secrets: run.secrets.0.keys().cloned().collect(),
         on_host: run.run.on_host,
+        mounts,
     })
+}
+
+/// The mounts `[jobs.<job>]` names, each checked against what the config's
+/// `mount_repos` lets `repo` mount: none is made unless every one is allowed.
+fn mounts(
+    job: &str,
+    named: &BTreeMap<String, String>,
+    repo: &str,
+    allowed: &BTreeMap<String, Vec<PathBuf>>,
+) -> Result<Vec<Mount>, String> {
+    if named.is_empty() {
+        return Ok(vec![]);
+    }
+    let Some(folders) = allowed
+        .iter()
+        .find(|(r, _)| r.eq_ignore_ascii_case(repo))
+        .map(|(_, f)| f)
+    else {
+        return Err(format!(
+            "refused: [jobs.{job}] names mounts, but {repo} is not on this host's mount_repos, so none of this host's folders is mounted for it"
+        ));
+    };
+    let mut made: Vec<Mount> = Vec::new();
+    for (host, container) in named {
+        let host_path = PathBuf::from(host);
+        if !crate::config::is_plain_absolute(&host_path) {
+            return Err(format!(
+                "refused: [jobs.{job}] mounts {host:?}, which is not an absolute path without .., : or ,"
+            ));
+        }
+        let Some(within) = folders.iter().find(|f| host_path.starts_with(f)) else {
+            let list: Vec<_> = folders.iter().map(|f| f.display().to_string()).collect();
+            return Err(format!(
+                "refused: [jobs.{job}] mounts {host}, which is outside the folders this host lets {repo} mount: {}",
+                list.join(", ")
+            ));
+        };
+        let container_path = Path::new(container);
+        if !crate::config::is_plain_absolute(container_path)
+            || container_path.parent().is_none()
+            || container_path == Path::new("/work")
+        {
+            return Err(format!(
+                "refused: [jobs.{job}] mounts {host} at {container:?}, which is not an absolute container path without .., : or , other than / and /work"
+            ));
+        }
+        if let Some(other) = made
+            .iter()
+            .find(|m| Path::new(&m.container) == container_path)
+        {
+            return Err(format!(
+                "refused: [jobs.{job}] mounts both {} and {host} at {container}",
+                other.host.display()
+            ));
+        }
+        made.push(Mount {
+            host: host_path,
+            container: container.clone(),
+            within: within.clone(),
+        });
+    }
+    Ok(made)
+}
+
+/// Each mount at its real host folder, symlinks followed, made if it is not
+/// there yet; failed if that is outside the folder it was allowed under.
+pub fn resolve(mounts: &[Mount]) -> Result<Vec<Mount>, String> {
+    mounts
+        .iter()
+        .map(|m| {
+            let within = std::fs::canonicalize(&m.within).map_err(|e| {
+                format!(
+                    "refused: {} is under {}, which this host's mount_repos names, but it cannot be read: {e}",
+                    m.host.display(),
+                    m.within.display()
+                )
+            })?;
+            let outside = |real: &Path| {
+                format!(
+                    "refused: {} is {}, outside {}, the folder this host lets it be under",
+                    m.host.display(),
+                    real.display(),
+                    within.display()
+                )
+            };
+            // The nearest folder of it that is there: what it would be made under.
+            let mut there = m.host.as_path();
+            while !there.exists() {
+                there = there.parent().unwrap_or(Path::new("/"));
+            }
+            let real = std::fs::canonicalize(there)
+                .map_err(|e| format!("refused: {}: {e}", there.display()))?;
+            if !real.starts_with(&within) {
+                return Err(outside(&real));
+            }
+            std::fs::create_dir_all(&m.host)
+                .map_err(|e| format!("could not make {}: {e}", m.host.display()))?;
+            let real = std::fs::canonicalize(&m.host)
+                .map_err(|e| format!("refused: {}: {e}", m.host.display()))?;
+            if !real.starts_with(&within) {
+                return Err(outside(&real));
+            }
+            if !crate::config::is_plain_absolute(&real) {
+                return Err(format!(
+                    "refused: {} is {}, which has a : or , podman cannot mount",
+                    m.host.display(),
+                    real.display()
+                ));
+            }
+            Ok(Mount {
+                host: real,
+                container: m.container.clone(),
+                within,
+            })
+        })
+        .collect()
 }
 
 /// The log's line for a job's start: its limits first, so a long command
@@ -220,7 +372,7 @@ pub fn launch_line(plan: &Plan) -> String {
         );
     }
     format!(
-        "running with {} CPU, {} MiB, {}a {}s timeout and {}{}{}: {}",
+        "running with {} CPU, {} MiB, {}a {}s timeout and {}{}{}{}: {}",
         plan.cpu,
         plan.memory,
         if plan.gpus.is_empty() {
@@ -239,6 +391,16 @@ pub fn launch_line(plan: &Plan) -> String {
             format!(", sent the host's {} credentials", kinds.join(" and "))
         },
         given,
+        if plan.mounts.is_empty() {
+            String::new()
+        } else {
+            let each: Vec<_> = plan
+                .mounts
+                .iter()
+                .map(|m| format!("{} at {}", m.host.display(), m.container))
+                .collect();
+            format!(", mounting {}", each.join(", "))
+        },
         plan.run.join(" ")
     )
 }
@@ -997,9 +1159,20 @@ impl<S: Service> Podman<S> {
         }
         let plan = match std::fs::read_to_string(dir.join("jobs.toml")) {
             Err(e) => Err(format!("no jobs.toml: {e}")),
-            Ok(text) => plan(&text, run, self.gpu_memory),
+            Ok(text) => plan(
+                &text,
+                run,
+                &Here {
+                    name: &self.name,
+                    gpu_memory: self.gpu_memory,
+                    mount_repos: &self.mount_repos,
+                },
+            ),
         };
-        let plan = match plan {
+        let plan = match plan.and_then(|mut plan| {
+            plan.mounts = resolve(&plan.mounts)?;
+            Ok(plan)
+        }) {
             Ok(plan) => plan,
             Err(e) => {
                 log.say(&e);
@@ -1077,6 +1250,11 @@ impl<S: Service> Podman<S> {
                 // Writable, so installs and build output land beside the sources; the
                 // checkout is the job's own and deleted after it, with the container.
                 .arg(format!("{}:/work:Z", dir.display()));
+            // Not relabeled, as /work is: they are the host's own folders, kept between runs.
+            for m in &plan.mounts {
+                cmd.arg("-v")
+                    .arg(format!("{}:{}", m.host.display(), m.container));
+            }
             if let Some(parent) = &self.cgroup_parent {
                 cmd.arg(format!("--cgroup-parent={parent}"));
             }
@@ -1467,7 +1645,20 @@ pub(crate) mod tests {
 
     /// A plan on a host whose GPUs have 24564 MiB.
     fn plan(text: &str, run: &Assignment) -> Result<Plan, String> {
-        super::plan(text, run, 24564)
+        on(text, run, 24564)
+    }
+
+    /// A plan on host `box`, whose GPUs have `gpu_memory` MiB, mounting nothing.
+    fn on(text: &str, run: &Assignment, gpu_memory: u64) -> Result<Plan, String> {
+        super::plan(
+            text,
+            run,
+            &Here {
+                name: "box",
+                gpu_memory,
+                mount_repos: &BTreeMap::new(),
+            },
+        )
     }
     use crate::budget::{Budget, Cpu, Resources};
     use crate::service::{HostRun, Requirements, Secrets};
@@ -1544,6 +1735,7 @@ run = ["python", "jobs/plain.py"]
                 credentials: vec![],
                 secrets: vec![],
                 on_host: false,
+                mounts: vec![],
             }
         );
         let p = plan(TOML, &assignment("plain", None, None, 1024)).unwrap();
@@ -1718,8 +1910,8 @@ run = ["python", "jobs/plain.py"]
                     [jobs.any]\nrun = [\"train\"]\n";
         let mut a = assignment("big", None, None, 1024);
         a.gpus = vec!["nvidia.com/gpu=0".into()];
-        assert_eq!(super::plan(toml, &a, 24564).unwrap().gpus.len(), 1);
-        let err = super::plan(toml, &a, 6144).unwrap_err();
+        assert_eq!(on(toml, &a, 24564).unwrap().gpus.len(), 1);
+        let err = on(toml, &a, 6144).unwrap_err();
         assert!(
             err.contains(
                 "over this host's 6144 MiB: submit it with requirements.gpuMemory = 16384"
@@ -1730,23 +1922,132 @@ run = ["python", "jobs/plain.py"]
         let mut a = assignment("any", None, None, 1024);
         a.gpus = vec!["nvidia.com/gpu=0".into()];
         a.run.requirements.gpu_memory = Some(4096);
-        assert_eq!(
-            super::plan(toml, &a, 6144).unwrap().gpus,
-            ["nvidia.com/gpu=0"]
-        );
+        assert_eq!(on(toml, &a, 6144).unwrap().gpus, ["nvidia.com/gpu=0"]);
     }
 
     #[test]
-    fn a_job_a_job_runner_runs_on_its_host_itself_is_refused_not_run_in_a_container() {
-        let e = plan(
-            "[jobs.restart]\nrun = [\"x\"]\nhost = \"laptop\"\n",
-            &assignment("restart", None, None, 1024),
-        )
-        .unwrap_err();
+    fn a_job_for_another_host_is_refused_saying_which_and_one_for_this_host_runs() {
+        let toml = "[jobs.render]\nrun = [\"x\"]\nhost = \"desktop\"\n";
+        let e = plan(toml, &assignment("render", None, None, 1024)).unwrap_err();
         assert!(
-            e.contains("submit the run onHost with requirements.host = \"laptop\""),
+            e.contains("runs on host desktop, not this host box: submit it with requirements.host = \"desktop\""),
             "{e}"
         );
+        let here = toml.replace("desktop", "box");
+        assert!(plan(&here, &assignment("render", None, None, 1024)).is_ok());
+    }
+
+    /// A plan on host `box` of `repo`'s job `render`, whose `jobs.toml` mounts `mounts`,
+    /// on a host whose config lets `o/studio` mount under `/data/studio` and `/models`.
+    fn mounting(repo: &str, mounts: &str) -> Result<Plan, String> {
+        let toml = format!("[jobs.render]\nrun = [\"x\"]\nmounts = {{ {mounts} }}\n");
+        let mut run = assignment("render", None, None, 1024);
+        run.run.repo = repo.into();
+        super::plan(
+            &toml,
+            &run,
+            &Here {
+                name: "box",
+                gpu_memory: 0,
+                mount_repos: &BTreeMap::from([(
+                    "o/studio".to_string(),
+                    vec![PathBuf::from("/data/studio"), PathBuf::from("/models")],
+                )]),
+            },
+        )
+    }
+
+    #[test]
+    fn an_allowed_repo_mounts_the_folders_it_names_under_its_allowed_ones() {
+        let p = mounting(
+            "O/Studio",
+            "\"/data/studio/dagster\" = \"/dagster\", \"/models\" = \"/opt/models\"",
+        )
+        .unwrap();
+        assert_eq!(
+            p.mounts,
+            [
+                Mount {
+                    host: "/data/studio/dagster".into(),
+                    container: "/dagster".into(),
+                    within: "/data/studio".into(),
+                },
+                Mount {
+                    host: "/models".into(),
+                    container: "/opt/models".into(),
+                    within: "/models".into(),
+                },
+            ]
+        );
+        assert!(
+            launch_line(&p).contains(
+                ", mounting /data/studio/dagster at /dagster, /models at /opt/models: x x"
+            ),
+            "{}",
+            launch_line(&p)
+        );
+        assert!(mounting("o/other", "").unwrap().mounts.is_empty());
+    }
+
+    #[test]
+    fn a_mount_its_repo_or_path_is_not_allowed_is_refused_saying_which() {
+        for (repo, mounts, says) in [
+            ("o/other", "\"/data/studio\" = \"/d\"", "o/other is not on this host's mount_repos"),
+            ("o/studio", "\"/data/studio2\" = \"/d\"", "mounts /data/studio2, which is outside the folders this host lets o/studio mount: /data/studio, /models"),
+            ("o/studio", "\"/etc\" = \"/d\"", "mounts /etc, which is outside"),
+            ("o/studio", "\"/data/studio/../../etc\" = \"/d\"", "not an absolute path"),
+            ("o/studio", "\"data/studio\" = \"/d\"", "not an absolute path"),
+            ("o/studio", "\"/data/studio\" = \"d\"", "not an absolute container path"),
+            ("o/studio", "\"/data/studio\" = \"/work\"", "other than / and /work"),
+            ("o/studio", "\"/data/studio\" = \"/\"", "other than / and /work"),
+            ("o/studio", "\"/data/studio\" = \"/a:b\"", "not an absolute container path"),
+            ("o/studio", "\"/data/studio/a\" = \"/d\", \"/models\" = \"/d/\"", "mounts both /data/studio/a and /models at /d/"),
+        ] {
+            let e = mounting(repo, mounts).unwrap_err();
+            assert!(e.contains(says), "{mounts}: {e}");
+        }
+        let mut run = assignment("render", None, None, 1024);
+        run.run.repo = "o/studio".into();
+        run.run.on_host = true;
+        let e = super::plan(
+            "[jobs.render]\nrun = [\"x\"]\nmounts = { \"/models\" = \"/m\" }\n",
+            &run,
+            &Here {
+                name: "box",
+                gpu_memory: 0,
+                mount_repos: &BTreeMap::from([(
+                    "o/studio".to_string(),
+                    vec![PathBuf::from("/models")],
+                )]),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("only a run in a container"), "{e}");
+    }
+
+    #[test]
+    fn a_mount_is_made_if_missing_and_refused_where_a_symlink_leads_out() {
+        let root = std::env::temp_dir().join(format!("jobber-host-mounts-{}", std::process::id()));
+        let within = root.join("allowed");
+        std::fs::create_dir_all(&within).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), within.join("link")).unwrap();
+        let mount = |host: PathBuf| Mount {
+            host,
+            container: "/m".into(),
+            within: within.clone(),
+        };
+        let made = resolve(&[mount(within.join("scene/1"))]).unwrap();
+        assert!(within.join("scene/1").is_dir());
+        assert_eq!(made[0].host, within.canonicalize().unwrap().join("scene/1"));
+        for host in [within.join("link"), within.join("link/new")] {
+            let e = resolve(&[mount(host.clone())]).unwrap_err();
+            assert!(e.contains("outside"), "{e}");
+        }
+        assert!(!root.join("outside/new").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        let e = resolve(&[mount(within.join("x"))]).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
     }
 
     #[test]
@@ -1803,6 +2104,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: host_runs.iter().map(|r| r.to_string()).collect(),
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         }
     }
 
@@ -1944,6 +2247,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: true,
+            mounts: vec![],
         };
         let log = Log::start(service.clone(), "j".into());
         let began = Instant::now();
@@ -2164,6 +2468,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         let log = Log::start(Arc::new(Recorder::default()), "j".into());
         let url = format!("file://{}", src.display());
@@ -2244,6 +2550,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         let budget = budget(1.0, 2048, 512);
         let job = budget
@@ -2296,6 +2604,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2318,6 +2628,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: false,
+            mounts: vec![],
         };
         let name = format!("job-ws-{}", std::process::id());
         let outcome = podman.contain(
@@ -2342,6 +2653,67 @@ run = ["python", "jobs/plain.py"]
     /// Needs rootless podman: `cargo test -- --ignored`.
     #[test]
     #[ignore]
+    fn a_job_sees_its_mounts_writes_there_as_the_hosts_user_and_the_next_run_reads_it() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("jobber-host-mount-{}", std::process::id()));
+        let podman = busybox_podman();
+        let run = |script: &str, n: u32| {
+            let service = Arc::new(Recorder::default());
+            let log = Log::start(service.clone(), "j".into());
+            let mounts = resolve(&[
+                Mount {
+                    host: root.join("models"),
+                    container: "/opt/models".into(),
+                    within: root.clone(),
+                },
+                Mount {
+                    host: root.join("out/scene-1"),
+                    container: "/out".into(),
+                    within: root.clone(),
+                },
+            ])
+            .unwrap();
+            let plan = Plan {
+                run: vec!["sh".into(), "-c".into(), script.into()],
+                memory: 64,
+                cpu: Cpu::of(0.5),
+                gpus: vec![],
+                timeout: 60,
+                stall: None,
+                credentials: vec![],
+                secrets: vec![],
+                on_host: false,
+                mounts,
+            };
+            let outcome = podman.contain(
+                &log,
+                "docker.io/library/busybox:latest",
+                &plan,
+                &[],
+                &std::env::temp_dir(),
+                &format!("job-mount-{}-{n}", std::process::id()),
+            );
+            log.close(Duration::from_secs(5));
+            let text = String::from_utf8_lossy(&service.0.lock().unwrap()).to_string();
+            assert!(matches!(outcome.state, End::Succeeded), "{text}");
+            text
+        };
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/weights"), "w\n").unwrap();
+        run("cat /opt/models/weights > /out/frame && mkdir /out/dir", 1);
+        let uid = std::fs::metadata(&root).unwrap().uid();
+        for made in ["out/scene-1/frame", "out/scene-1/dir"] {
+            let meta = std::fs::metadata(root.join(made)).unwrap();
+            assert_eq!((meta.uid(), made), (uid, made));
+        }
+        let text = run("cat /out/frame", 2);
+        assert!(text.contains("\nw\n") || text.starts_with("w\n"), "{text}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Needs rootless podman: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
     fn a_job_is_sent_only_the_credentials_given_it_and_reads_them_masked() {
         let podman = Podman {
             service: Arc::new(Recorder::default()),
@@ -2358,6 +2730,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2382,6 +2756,7 @@ run = ["python", "jobs/plain.py"]
                 credentials: vec![],
                 secrets: vec![],
                 on_host: false,
+                mounts: vec![],
             };
             let name = format!("job-cred-{}-{}", std::process::id(), env.len());
             let outcome = podman.contain(
@@ -2429,6 +2804,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         }
     }
 
@@ -2449,6 +2826,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: false,
+            mounts: vec![],
         };
         let started = Instant::now();
         let outcome = podman.contain(
@@ -2489,6 +2867,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: false,
+            mounts: vec![],
         };
         let outcome = podman.contain(
             &log,
@@ -2584,6 +2963,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2626,6 +3007,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: false,
+            mounts: vec![],
         };
         let started = Instant::now();
         let outcome = podman.contain(
@@ -2676,6 +3058,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2706,6 +3090,7 @@ run = ["python", "jobs/plain.py"]
             credentials: vec![],
             secrets: vec![],
             on_host: false,
+            mounts: vec![],
         };
         let outcome = podman.contain(
             &log,
@@ -2810,6 +3195,8 @@ run = ["python", "jobs/plain.py"]
             stopping: || false,
             host_runs: vec![],
             gpu_memory: 0,
+            name: "box".into(),
+            mount_repos: BTreeMap::new(),
         };
         let mut c = assignment("wait", None, Some(600), 256);
         c.run.id = id.clone();

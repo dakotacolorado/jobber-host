@@ -54,6 +54,10 @@ pub struct Config {
     pub gpus: Vec<String>,
     /// MiB of memory of its smallest GPU; none: as `nvidia-smi` measures it.
     pub gpu_memory: Option<u64>,
+    /// Repos (`owner/name`) whose jobs may mount this host's folders, each
+    /// with the folders under which what they mount must be; any other
+    /// repo's job that names mounts is failed unrun.
+    pub mount_repos: BTreeMap<String, Vec<PathBuf>>,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -132,6 +136,8 @@ struct File {
     #[serde(default)]
     gpus: Vec<String>,
     gpu_memory: Option<u64>,
+    #[serde(default)]
+    mount_repos: BTreeMap<String, Vec<PathBuf>>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
@@ -269,15 +275,7 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
             .host_runs
             .into_iter()
             .map(|repo| {
-                let mut parts = repo.split('/');
-                let ok = |p: Option<&str>| {
-                    p.is_some_and(|p| {
-                        !p.is_empty()
-                            && p.chars()
-                                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
-                    })
-                };
-                if ok(parts.next()) && ok(parts.next()) && parts.next().is_none() {
+                if is_repo(&repo) {
                     Ok(repo)
                 } else {
                     Err(format!("host_runs {repo:?} must be a repo, owner/name"))
@@ -286,7 +284,53 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
             .collect::<Result<_, _>>()?,
         gpus: gpus(file.gpus)?,
         gpu_memory: file.gpu_memory,
+        mount_repos: mount_repos(file.mount_repos)?,
     })
+}
+
+fn is_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let ok = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        })
+    };
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+/// Whether `path` can be given to `podman run -v` as it reads: absolute,
+/// with no `..` to climb out of where it is checked to be, and no `:` or
+/// `,`, which `-v` reads as its own.
+pub fn is_plain_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        && path.to_str().is_some_and(|p| !p.contains([':', ',']))
+}
+
+fn mount_repos(
+    repos: BTreeMap<String, Vec<PathBuf>>,
+) -> Result<BTreeMap<String, Vec<PathBuf>>, String> {
+    for (repo, folders) in &repos {
+        if !is_repo(repo) {
+            return Err(format!("mount_repos {repo:?} must be a repo, owner/name"));
+        }
+        if folders.is_empty() {
+            return Err(format!(
+                "mount_repos {repo:?} names no folder: list the folders its jobs may mount, e.g. [\"/srv/{repo}\"]"
+            ));
+        }
+        if let Some(f) = folders.iter().find(|f| !is_plain_absolute(f)) {
+            return Err(format!(
+                "mount_repos {repo:?} folder {} must be an absolute path without .., : or ,",
+                f.display()
+            ));
+        }
+    }
+    Ok(repos)
 }
 
 /// CDI device names, each once: `vendor/class=name`, as `nvidia-ctk cdi list` prints them.
@@ -365,8 +409,33 @@ mod tests {
                 host_runs: vec![],
                 gpus: vec![],
                 gpu_memory: None,
+                mount_repos: BTreeMap::new(),
             }
         );
+    }
+
+    #[test]
+    fn mount_repos_names_repos_each_with_absolute_folders() {
+        let with = |table: &str| read(&format!("{BASE}[mount_repos]\n{table}\n"));
+        assert_eq!(
+            with("\"o/studio\" = [\"/data/models\", \"/data/out\"]")
+                .unwrap()
+                .mount_repos,
+            BTreeMap::from([(
+                "o/studio".to_string(),
+                vec![PathBuf::from("/data/models"), PathBuf::from("/data/out")]
+            )])
+        );
+        for (bad, says) in [
+            ("\"studio\" = [\"/data\"]", "must be a repo"),
+            ("\"o/studio\" = []", "names no folder"),
+            ("\"o/studio\" = [\"data\"]", "absolute path"),
+            ("\"o/studio\" = [\"/data/../etc\"]", "absolute path"),
+            ("\"o/studio\" = [\"/da:ta\"]", "absolute path"),
+        ] {
+            let err = with(bad).unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
     }
 
     #[test]

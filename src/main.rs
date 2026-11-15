@@ -219,6 +219,8 @@ fn podman(config: &Config, hosts: Arc<Hosts>, gpu_memory: u64) -> Podman<Hosts> 
         stopping: sys::stopping,
         host_runs: config.host_runs.clone(),
         gpu_memory,
+        name: config.name.clone(),
+        mount_repos: config.mount_repos.clone(),
     }
 }
 
