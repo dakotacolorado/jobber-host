@@ -1,6 +1,7 @@
 mod banner;
 mod budget;
 mod capacity;
+mod cellar;
 mod config;
 mod connection;
 mod credentials;
@@ -221,6 +222,8 @@ fn podman(config: &Config, hosts: Arc<Hosts>, gpu_memory: u64) -> Podman<Hosts> 
         gpu_memory,
         name: config.name.clone(),
         mount_repos: config.mount_repos.clone(),
+        cellar: config.cellar.clone(),
+        home: config.home.clone(),
     }
 }
 

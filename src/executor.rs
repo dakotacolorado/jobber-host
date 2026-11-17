@@ -59,6 +59,10 @@ pub struct Podman<S: Service> {
     /// Repos whose jobs may mount this host's folders, each with the folders
     /// what they mount must be under: the config's `mount_repos`.
     pub mount_repos: BTreeMap<String, Vec<PathBuf>>,
+    /// The drive every run is given: the config's `[cellar]`.
+    pub cellar: Option<crate::cellar::Cellar>,
+    /// The user's home, where cellar-host's state is by default.
+    pub home: PathBuf,
 }
 
 // --- jobs.toml ---------------------------------------------------------------
@@ -1205,6 +1209,9 @@ impl<S: Service> Podman<S> {
             secret: true,
         }));
         log.mask(env.iter().filter(|v| v.secret).map(|v| v.value.clone()));
+        if let Some(cellar) = &self.cellar {
+            env.extend(cellar.env(id));
+        }
         if log.canceled() {
             return Outcome {
                 state: End::Canceled,
@@ -1255,6 +1262,7 @@ impl<S: Service> Podman<S> {
                 cmd.arg("-v")
                     .arg(format!("{}:{}", m.host.display(), m.container));
             }
+            cmd.args(self.cellar_args());
             if let Some(parent) = &self.cgroup_parent {
                 cmd.arg(format!("--cgroup-parent={parent}"));
             }
@@ -1396,6 +1404,14 @@ impl<S: Service> Podman<S> {
             why.reason.as_deref().unwrap_or("canceled")
         ));
         Some(why)
+    }
+
+    /// What `podman run` is given of the drive: nothing without `[cellar]`.
+    fn cellar_args(&self) -> Vec<String> {
+        match &self.cellar {
+            None => vec![],
+            Some(c) => c.podman_args(c.cli_file().as_deref(), c.socket_dir(&self.home).as_deref()),
+        }
     }
 
     /// Runs the job on this host itself, as its user, in its checkout, with
@@ -1571,7 +1587,28 @@ impl<S: Service> Executor for Podman<S> {
         let id = run.run.id.clone();
         let started = Instant::now();
         let log = Log::start(self.service.clone(), id.clone());
+        let since = std::time::SystemTime::now();
+        let device = self.cellar.as_ref().and_then(|c| {
+            let dir = c.run_dir(&id);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                log.say(&format!(
+                    "cellar: could not make {}: {e}; the run goes on without it",
+                    dir.display()
+                ));
+            }
+            c.device()
+        });
         let outcome = self.run_job(&log, &run, &reservation, budget);
+        if let Some(c) = &self.cellar {
+            if !run.run.on_host && device.is_some() && c.device() != device {
+                log.say(&format!(
+                    "cellar: {} was mounted again while it ran (cellar-host restarted), and a running container keeps its old mount: from then on, {} did not answer in it",
+                    c.mount.display(),
+                    c.mount.display()
+                ));
+            }
+            log.say(&c.sync(since));
+        }
         log.say(&format!(
             "{}{}{}",
             match outcome.state {
@@ -2083,12 +2120,12 @@ run = ["python", "jobs/plain.py"]
     }
 
     /// A Podman whose repos are cloned from `git_base`, running runs `onHost` for `host_runs`.
-    fn host_podman(
-        service: Arc<Recorder>,
+    fn host_podman<S: Service>(
+        service: Arc<S>,
         work_dir: PathBuf,
         git_base: String,
         host_runs: &[&str],
-    ) -> Podman<Recorder> {
+    ) -> Podman<S> {
         Podman {
             service,
             work_dir,
@@ -2106,6 +2143,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         }
     }
 
@@ -2204,6 +2243,100 @@ run = ["python", "jobs/plain.py"]
             .to_string();
         assert!(log.contains(&format!("uid={uid}\n")), "{log}");
         assert!(log.contains("running on this host itself"), "{log}");
+    }
+
+    /// A service that keeps the log as it stood when the run was reported.
+    #[derive(Default)]
+    struct Reported(Recorder, Mutex<Option<(String, Report)>>);
+
+    impl Service for Reported {
+        fn append(&self, job: &str, offset: u64, bytes: &[u8]) -> Result<Appended, Failure> {
+            self.0.append(job, offset, bytes)
+        }
+        fn report(&self, _: &str, report: &Report) -> Result<(), Failure> {
+            let log = String::from_utf8_lossy(&self.0 .0.lock().unwrap()).to_string();
+            *self.1.lock().unwrap() = Some((log, report.clone()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn with_cellar_a_run_gets_its_folder_and_its_end_waits_for_the_sync_which_never_fails_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("jobber-host-cellar-run-{}", std::process::id()));
+        let commit = host_repo(
+            &root,
+            "[jobs.deploy]\nrun = [\"sh\", \"-c\", \"echo dir=$CELLAR_RUN_DIR; echo hi > $CELLAR_RUN_DIR/out\"]\n",
+        );
+        let cli = root.join("cellar");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\necho 'timed out with 3 changes not yet uploaded:' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = Arc::new(Reported::default());
+        let mut podman = host_podman(
+            service.clone(),
+            root.join("work"),
+            format!("file://{}/", root.display()),
+            &["o/deploy"],
+        );
+        let cellar = crate::cellar::Cellar {
+            mount: root.join("drive"),
+            sync_timeout: 7,
+            cli,
+            config: root.join("cellar-host.toml"),
+        };
+        podman.cellar = Some(cellar.clone());
+        assert_eq!(
+            podman.cellar_args(),
+            [
+                format!(
+                    "--mount=type=bind,src={0},dst={0},bind-propagation=rslave",
+                    cellar.mount.display()
+                ),
+                format!(
+                    "--mount=type=bind,src={},dst=/usr/local/bin/cellar,ro",
+                    cellar.cli.display()
+                ),
+            ]
+        );
+        let run = host_run(commit, &[]);
+        let budget = budget(2.0, 4096, 512);
+        let reservation = budget
+            .reserve_job(Resources {
+                cpu: Cpu::of(0.5),
+                memory: 1024,
+                gpu: 0,
+            })
+            .unwrap();
+        podman.run(run.clone(), reservation, &budget);
+        let (log, report) = service.1.lock().unwrap().take().unwrap();
+        let wrote = std::fs::read_to_string(cellar.run_dir(&run.run.id).join("out"));
+        remove(&root);
+        assert!(matches!(report.state, End::Succeeded), "{report:?}: {log}");
+        assert!(
+            log.contains(&format!("dir={}\n", cellar.run_dir(&run.run.id).display())),
+            "{log}"
+        );
+        assert_eq!(wrote.unwrap(), "hi\n");
+        let synced = log
+            .find("cellar: 3 files still uploading after 7s")
+            .expect(&log);
+        assert!(synced < log.find("succeeded").unwrap(), "{log}");
+    }
+
+    #[test]
+    fn without_cellar_a_container_gets_no_drive() {
+        let p = host_podman(
+            Arc::new(Recorder::default()),
+            PathBuf::new(),
+            String::new(),
+            &[],
+        );
+        assert!(p.cellar_args().is_empty());
     }
 
     #[test]
@@ -2470,6 +2603,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         let log = Log::start(Arc::new(Recorder::default()), "j".into());
         let url = format!("file://{}", src.display());
@@ -2552,6 +2687,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         let budget = budget(1.0, 2048, 512);
         let job = budget
@@ -2606,6 +2743,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2732,6 +2871,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -2806,6 +2947,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         }
     }
 
@@ -2965,6 +3108,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -3060,6 +3205,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         assert!(Command::new("podman")
             .args(["pull", "-q", "docker.io/library/busybox:latest"])
@@ -3197,6 +3344,8 @@ run = ["python", "jobs/plain.py"]
             gpu_memory: 0,
             name: "box".into(),
             mount_repos: BTreeMap::new(),
+            cellar: None,
+            home: PathBuf::new(),
         };
         let mut c = assignment("wait", None, Some(600), 256);
         c.run.id = id.clone();
