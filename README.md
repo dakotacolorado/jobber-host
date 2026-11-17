@@ -77,6 +77,10 @@ Every setting is in `config.toml`, at `$XDG_CONFIG_HOME/jobber-host/` or
 | `work_dir` | `~/.local/share/jobber-host` | Where run checkouts are made. |
 | `slice.memory_max` | what it offers | The slice's systemd `MemoryMax`, e.g. `"8G"`. |
 | `slice.cpu_weight` | `20` | The slice's systemd `CPUWeight`. |
+| `cellar.mount` | `/cellar` | Where [cellar-host](https://github.com/dakotacolorado/cellar-host) mounts the drive. With no `[cellar]`, runs get no drive. |
+| `cellar.sync_timeout` | `600` | Seconds a run's end waits for what it wrote to upload. |
+| `cellar.cli` | `~/.local/bin/cellar` | The `cellar` CLI. |
+| `cellar.config` | `~/.config/cellar-host/config.toml` | cellar-host's config, which names its control socket. |
 
 `jobber-host --slice-unit` prints the slice's systemd unit.
 
@@ -132,6 +136,19 @@ give each its own.
 
 A run's **secrets** reach it as environment variables of their names. They are
 masked in its log and never written to disk.
+
+With **`[cellar]`**, every run gets its own folder on the drive,
+`/cellar/jobber/runs/<run id>`, made before it starts and named in
+`CELLAR_RUN_DIR`. Its container has `/cellar` bind-mounted (`rslave`), the
+`cellar` CLI at `/usr/local/bin/cellar` (it needs a glibc image) and the
+daemon's control socket; an onHost run sees `/cellar` already. Write outputs
+there for a later run on any host to read. When the run ends, before it is
+reported, jobber-host runs `cellar sync --since <its start>`, waiting up to
+`sync_timeout` for what was written on this machine to upload. A timeout is
+said in the run's log (`cellar: N files still uploading`) and does not fail
+the run; the files upload after it. A cellar-host restart mounts the drive
+anew, and a running container keeps the old mount, so `/cellar` stops
+answering in it until the run ends; its log says so.
 
 An **onHost** run, for a repo in `host_runs`, runs on the machine itself as
 jobber-host's user, in its checkout, with no CPU or memory cap and no stall

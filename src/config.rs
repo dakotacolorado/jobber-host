@@ -58,6 +58,20 @@ pub struct Config {
     /// with the folders under which what they mount must be; any other
     /// repo's job that names mounts is failed unrun.
     pub mount_repos: BTreeMap<String, Vec<PathBuf>>,
+    /// The drive cellar-host mounts, given to every run; none: runs see no drive.
+    pub cellar: Option<crate::cellar::Cellar>,
+    /// The user's home, where cellar-host's own defaults are.
+    pub home: PathBuf,
+}
+
+/// `[cellar]` as written.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellarFile {
+    mount: Option<PathBuf>,
+    sync_timeout: Option<u64>,
+    cli: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -138,10 +152,12 @@ struct File {
     gpu_memory: Option<u64>,
     #[serde(default)]
     mount_repos: BTreeMap<String, Vec<PathBuf>>,
+    cellar: Option<CellarFile>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
 struct Dirs {
+    home: PathBuf,
     config: PathBuf,
     state: PathBuf,
     data: PathBuf,
@@ -158,6 +174,7 @@ impl Dirs {
                 .map(|d| d.join("jobber-host"))
         };
         Some(Dirs {
+            home: home.clone()?,
             config: dir("XDG_CONFIG_HOME", ".config")?,
             state: dir("XDG_STATE_HOME", ".local/state")?,
             data: dir("XDG_DATA_HOME", ".local/share")?,
@@ -285,6 +302,40 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
         gpus: gpus(file.gpus)?,
         gpu_memory: file.gpu_memory,
         mount_repos: mount_repos(file.mount_repos)?,
+        cellar: file.cellar.map(|c| cellar(c, &dirs.home)).transpose()?,
+        home: dirs.home.clone(),
+    })
+}
+
+/// `[cellar]`, its paths where cellar-host puts them by default.
+fn cellar(file: CellarFile, home: &Path) -> Result<crate::cellar::Cellar, String> {
+    let path = |key: &str, p: Option<PathBuf>, default: &str| {
+        let p = p.unwrap_or_else(|| home.join(default));
+        if is_plain_absolute(&p) {
+            Ok(p)
+        } else {
+            Err(format!(
+                "cellar.{key} {} must be an absolute path without .., : or ,",
+                p.display()
+            ))
+        }
+    };
+    let sync_timeout = file.sync_timeout.unwrap_or(600);
+    if sync_timeout == 0 {
+        return Err(
+            "cellar.sync_timeout is 0: give the seconds a run's end waits for its writes to upload"
+                .into(),
+        );
+    }
+    Ok(crate::cellar::Cellar {
+        mount: path(
+            "mount",
+            Some(file.mount.unwrap_or_else(|| "/cellar".into())),
+            "",
+        )?,
+        sync_timeout,
+        cli: path("cli", file.cli, ".local/bin/cellar")?,
+        config: path("config", file.config, ".config/cellar-host/config.toml")?,
     })
 }
 
@@ -410,8 +461,47 @@ mod tests {
                 gpus: vec![],
                 gpu_memory: None,
                 mount_repos: BTreeMap::new(),
+                cellar: None,
+                home: "/home/me".into(),
             }
         );
+    }
+
+    #[test]
+    fn cellar_gives_the_drive_its_sync_timeout_and_cellar_hosts_cli_and_config() {
+        let with = |table: &str| read(&format!("{BASE}[cellar]\n{table}\n"));
+        assert_eq!(
+            with("").unwrap().cellar,
+            Some(crate::cellar::Cellar {
+                mount: "/cellar".into(),
+                sync_timeout: 600,
+                cli: "/home/me/.local/bin/cellar".into(),
+                config: "/home/me/.config/cellar-host/config.toml".into(),
+            })
+        );
+        assert_eq!(
+            with("mount = \"/d\"\nsync_timeout = 5\ncli = \"/b/cellar\"\nconfig = \"/c.toml\"")
+                .unwrap()
+                .cellar,
+            Some(crate::cellar::Cellar {
+                mount: "/d".into(),
+                sync_timeout: 5,
+                cli: "/b/cellar".into(),
+                config: "/c.toml".into(),
+            })
+        );
+        for (bad, says) in [
+            (
+                "mount = \"cellar\"",
+                "cellar.mount cellar must be an absolute path",
+            ),
+            ("config = \"/a,b\"", "cellar.config /a,b must be"),
+            ("sync_timeout = 0", "cellar.sync_timeout is 0"),
+            ("socket = \"/s\"", "unknown field"),
+        ] {
+            let e = with(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 
     #[test]
