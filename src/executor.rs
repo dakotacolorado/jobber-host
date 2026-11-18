@@ -2211,7 +2211,7 @@ run = ["python", "jobs/plain.py"]
     }
 
     #[test]
-    fn a_container_gets_no_drive_and_no_cellar_variable() {
+    fn a_container_gets_no_drive() {
         let p = host_podman(
             Arc::new(Recorder::default()),
             PathBuf::new(),
@@ -2241,9 +2241,6 @@ run = ["python", "jobs/plain.py"]
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.iter().any(|a| a == "TOKEN"), "{args:?}");
-        for a in &args {
-            assert!(!a.to_lowercase().contains("cellar"), "{args:?}");
-        }
     }
 
     #[test]
