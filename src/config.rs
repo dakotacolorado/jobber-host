@@ -58,8 +58,6 @@ pub struct Config {
     /// with the folders under which what they mount must be; any other
     /// repo's job that names mounts is failed unrun.
     pub mount_repos: BTreeMap<String, Vec<PathBuf>>,
-    /// The file still holds a `[cellar]` table, which is read and ignored.
-    pub cellar_ignored: bool,
 }
 
 /// CPUs and MiB kept back from runs, as Kubernetes' `system-reserved`.
@@ -140,8 +138,6 @@ struct File {
     gpu_memory: Option<u64>,
     #[serde(default)]
     mount_repos: BTreeMap<String, Vec<PathBuf>>,
-    /// Written by older installs; read so it does not stop the daemon, never used.
-    cellar: Option<toml::Value>,
 }
 
 /// Where a setting's file lives by default, under XDG's directories.
@@ -289,7 +285,6 @@ fn parse(text: &str, dirs: &Dirs) -> Result<Config, String> {
         gpus: gpus(file.gpus)?,
         gpu_memory: file.gpu_memory,
         mount_repos: mount_repos(file.mount_repos)?,
-        cellar_ignored: file.cellar.is_some(),
     })
 }
 
@@ -415,19 +410,8 @@ mod tests {
                 gpus: vec![],
                 gpu_memory: None,
                 mount_repos: BTreeMap::new(),
-                cellar_ignored: false,
             }
         );
-    }
-
-    #[test]
-    fn a_leftover_cellar_table_is_read_and_flagged_as_ignored() {
-        let with = read(&format!(
-            "{BASE}[cellar]\nmount = \"/cellar\"\nsync_timeout = 5\n"
-        ))
-        .unwrap();
-        assert!(with.cellar_ignored);
-        assert!(!read(BASE).unwrap().cellar_ignored);
     }
 
     #[test]

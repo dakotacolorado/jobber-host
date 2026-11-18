@@ -104,9 +104,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if config.cellar_ignored {
-        log!("jobber-host: the config's [cellar] table is ignored: runs get no drive");
-    }
     // What the machine has less what is kept back, measured now: each start registers it again.
     let (measured, offered) = match capacity::measure().and_then(|m| {
         capacity::allocatable(m, &config.reserve, config.job_memory_overhead).map(|a| (m, a))
